@@ -252,3 +252,88 @@ async def generate_replan(
             print(f"[agent] rid={request_id} replan attempt={attempt + 1} error: {e}")
 
     raise last_error or AgentError("Unknown replan failure")
+
+
+# ---------------------------------------------------------------------------
+# Next-step generation (per-step re-screenshot flow)
+# ---------------------------------------------------------------------------
+_NEXT_STEP_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "next_step_prompt.txt"
+_NEXT_STEP_PROMPT_TEMPLATE = _NEXT_STEP_PROMPT_PATH.read_text()
+
+
+async def generate_next_step(
+    goal: str,
+    image_size: ImageSize,
+    screenshot_bytes: bytes,
+    completed_steps: str,
+    total_steps: int,
+    learning_profile: str | None = None,
+    app_context: str | None = None,
+    request_id: str = "",
+) -> StepPlan:
+    """
+    Given a fresh screenshot after the user completed a step, identify
+    the next 1-2 actions. Returns a StepPlan with only those steps.
+    """
+    client = _get_client()
+
+    image_size_json = json.dumps({"w": image_size.w, "h": image_size.h})
+    prompt = _NEXT_STEP_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{IMAGE_SIZE_JSON}}", image_size_json)
+    prompt = prompt.replace("{{COMPLETED_STEPS_JSON}}", completed_steps)
+    prompt = prompt.replace("{{TOTAL_STEPS}}", str(total_steps))
+    prompt = prompt.replace("{{LEARNING_PROFILE_TEXT}}", learning_profile or "default")
+    prompt = prompt.replace("{{APP_CONTEXT_JSON}}", app_context or "{}")
+
+    screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+
+    model = os.getenv("OPENAI_NEXT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o"))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_b64}",
+                        "detail": "high",
+                    },
+                },
+            ],
+        }
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            print(f"[agent] rid={request_id} next-step attempt={attempt + 1} model={model}")
+
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=1000,
+                temperature=0.1,
+            )
+
+            raw_text = response.choices[0].message.content or ""
+            print(f"[agent] rid={request_id} next-step response length={len(raw_text)}")
+
+            plan_dict = _extract_json(raw_text)
+            plan = StepPlan.model_validate(plan_dict)
+
+            print(f"[agent] rid={request_id} next-step validated: {len(plan.steps)} steps")
+            return plan
+
+        except AgentError:
+            raise
+        except json.JSONDecodeError as e:
+            last_error = AgentError(f"Invalid JSON from model on next-step: {e}")
+            print(f"[agent] rid={request_id} next-step attempt={attempt + 1} JSON error: {e}")
+        except Exception as e:
+            last_error = AgentError(f"Next-step model call failed: {type(e).__name__}: {e}")
+            print(f"[agent] rid={request_id} next-step attempt={attempt + 1} error: {e}")
+
+    raise last_error or AgentError("Unknown next-step failure")
