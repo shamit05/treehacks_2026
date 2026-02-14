@@ -9,54 +9,71 @@ import SwiftUI
 
 struct OverlayContentView: View {
     @ObservedObject var stateMachine: GuidanceStateMachine
-    let screenBounds: CGRect
 
     var body: some View {
-        ZStack {
-            // Semi-transparent background
-            Color.black.opacity(0.4)
-                .allowsHitTesting(false)
-
-            if let plan = stateMachine.currentPlan,
-               stateMachine.currentStepIndex < plan.steps.count {
-                let step = plan.steps[stateMachine.currentStepIndex]
-
-                // Draw highlight rects (cut-outs)
-                ForEach(Array(step.targets.enumerated()), id: \.offset) { _, target in
-                    HighlightRect(target: target, screenBounds: screenBounds)
+        Group {
+            switch stateMachine.phase {
+            case .idle:
+                EmptyView()
+            case .inputGoal:
+                GoalInputView(stateMachine: stateMachine)
+            case .loading:
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(1.2)
+                        .tint(.blue)
+                    Text("Taking screenshot and generating plan...")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    Text("This may take a few seconds.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-
-                // Instruction bubble
-                InstructionBubble(
-                    instruction: step.instruction,
-                    stepNumber: stateMachine.currentStepIndex + 1,
-                    totalSteps: plan.steps.count
-                )
+                .padding(20)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .frame(maxWidth: 500)
+            case .guiding:
+                if let plan = stateMachine.currentPlan,
+                   stateMachine.currentStepIndex < plan.steps.count {
+                    let step = plan.steps[stateMachine.currentStepIndex]
+                    InstructionBubble(
+                        instruction: step.instruction,
+                        stepNumber: stateMachine.currentStepIndex + 1,
+                        totalSteps: plan.steps.count
+                    )
+                } else {
+                    VStack(spacing: 8) {
+                        Text("Waiting for plan...")
+                            .foregroundColor(.primary)
+                            .font(.headline)
+                        Text("Preparing next guidance step.")
+                            .foregroundColor(.secondary)
+                            .font(.caption)
+                    }
+                    .padding(20)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .frame(maxWidth: 500)
+                }
+            case .completed:
+                CompletionView(stateMachine: stateMachine)
+            case .error(let message):
+                VStack(spacing: 12) {
+                    Text("Error")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    Text(message)
+                        .font(.body)
+                        .foregroundColor(.primary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(20)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .frame(maxWidth: 500)
             }
         }
-        .frame(width: screenBounds.width, height: screenBounds.height)
-        .edgesIgnoringSafeArea(.all)
-    }
-}
-
-// MARK: - HighlightRect
-
-struct HighlightRect: View {
-    let target: TargetRect
-    let screenBounds: CGRect
-
-    var body: some View {
-        // Convert normalized coords to screen pixels
-        let x = target.x * screenBounds.width
-        let y = target.y * screenBounds.height
-        let w = target.w * screenBounds.width
-        let h = target.h * screenBounds.height
-
-        RoundedRectangle(cornerRadius: 8)
-            .stroke(Color.blue, lineWidth: 3)
-            .background(Color.white.opacity(0.1))
-            .frame(width: w, height: h)
-            .position(x: x + w / 2, y: y + h / 2)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.clear)
     }
 }
 
@@ -66,6 +83,8 @@ struct InstructionBubble: View {
     let instruction: String
     let stepNumber: Int
     let totalSteps: Int
+    @State private var dragOffset: CGSize = .zero
+    @State private var dragStartOffset: CGSize = .zero
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -79,9 +98,20 @@ struct InstructionBubble: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding()
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .frame(maxWidth: 360)
-        .padding(.bottom, 80)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .offset(dragOffset)
+        .gesture(
+            DragGesture()
+                .onChanged { value in
+                    dragOffset = CGSize(
+                        width: dragStartOffset.width + value.translation.width,
+                        height: dragStartOffset.height + value.translation.height
+                    )
+                }
+                .onEnded { _ in
+                    dragStartOffset = dragOffset
+                }
+        )
     }
 }

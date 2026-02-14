@@ -24,19 +24,23 @@ Server runs at `http://localhost:8000`. Health check: `GET /health`.
 
 ### Mac Client (Swift)
 
-Open `mac-client/` in Xcode:
+**Recommended — run as .app (shows in Accessibility):**
 ```bash
 cd mac-client
-open Package.swift
+chmod +x run.sh
+./run.sh
 ```
 
-Or build from terminal:
+On first run, add **OverlayGuide** to System Settings > Privacy & Security > Accessibility (click + and select the OverlayGuide.app that appears). Then press **Cmd+Option+O** to toggle the overlay.
+
+**Or build and run directly:**
 ```bash
 cd mac-client
-swift build
+swift run OverlayGuide
 ```
+(Requires adding Terminal to Accessibility, or the binary path when prompted.)
 
-> Requires macOS 13+ and Screen Recording permission.
+> Requires macOS 13+, Screen Recording permission, and Accessibility permission for the hotkey.
 
 ## Architecture
 

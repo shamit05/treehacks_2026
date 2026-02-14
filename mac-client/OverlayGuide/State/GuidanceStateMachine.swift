@@ -7,6 +7,7 @@
 //
 // This is an ObservableObject so SwiftUI views can react to changes.
 
+import AppKit
 import Combine
 import Foundation
 
@@ -36,6 +37,8 @@ class GuidanceStateMachine: ObservableObject {
 
     private let networkClient: AgentNetworkClient
     private let captureService: ScreenCaptureService
+    private let lastGoalPath = "/tmp/overlayguide_last_goal.txt"
+    private let lastScreenshotPath = "/tmp/overlayguide_last_screenshot.png"
 
     init(networkClient: AgentNetworkClient, captureService: ScreenCaptureService) {
         self.networkClient = networkClient
@@ -62,15 +65,30 @@ class GuidanceStateMachine: ObservableObject {
         }
     }
 
+    /// Explicitly show goal input overlay.
+    func showInputOverlay() {
+        guard phase != .loading else { return }
+        currentPlan = nil
+        currentStepIndex = 0
+        hintMessage = nil
+        phase = .inputGoal
+    }
+
     /// User submitted a goal
     func submitGoal(_ goal: String) {
         guard phase == .inputGoal else { return }
         session.goal = goal
-        phase = .loading
+        // Hide overlay before capture so the popup is never included in the screenshot.
+        phase = .idle
 
         Task { @MainActor in
             do {
+                // Give the window system a brief moment to remove overlay windows.
+                try? await Task.sleep(nanoseconds: 150_000_000)
                 let screenshot = try await captureService.captureMainDisplay()
+                saveDebugArtifacts(goal: goal, screenshotData: screenshot.imageData)
+                // Show loading only after the screenshot is already captured.
+                self.phase = .loading
                 let plan = try await networkClient.requestPlan(
                     goal: goal,
                     screenshotData: screenshot.imageData,
@@ -155,6 +173,21 @@ class GuidanceStateMachine: ObservableObject {
         session.events.append(event)
         if session.events.count > SessionSnapshot.maxEvents {
             session.events.removeFirst()
+        }
+    }
+
+    private func saveDebugArtifacts(goal: String, screenshotData: Data) {
+        let goalURL = URL(fileURLWithPath: lastGoalPath)
+        let screenshotURL = URL(fileURLWithPath: lastScreenshotPath)
+        do {
+            if let goalData = goal.data(using: .utf8) {
+                try goalData.write(to: goalURL)
+            }
+            try screenshotData.write(to: screenshotURL)
+            print("[Debug] Saved goal to \(lastGoalPath)")
+            print("[Debug] Saved screenshot to \(lastScreenshotPath)")
+        } catch {
+            print("[Debug] Failed to save artifacts: \(error.localizedDescription)")
         }
     }
 }

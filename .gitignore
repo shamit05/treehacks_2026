@@ -31,6 +31,7 @@ xcuserdata/
 ## Swift Package Manager
 .build/
 Package.resolved
+OverlayGuide.app/
 *.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
 
 ## CocoaPods (if used)

@@ -21,10 +21,29 @@ class ScreenCaptureService {
     /// Capture the main display. Timeout: 5s.
     /// - Returns: ScreenshotResult with image data and metadata
     func captureMainDisplay() async throws -> ScreenshotResult {
-        // TODO: Implement ScreenCaptureKit capture (preferred)
-        // TODO: Fallback to CGDisplayCreateImage if SCK unavailable
-        // TODO: Check Screen Recording permission first
+        print("[Capture] Starting main display capture")
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            throw CaptureError.permissionDenied
+        }
 
+        let result = try await withThrowingTaskGroup(of: ScreenshotResult.self) { group in
+            group.addTask {
+                try await self.performCapture()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                throw CaptureError.timeout
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+        print("[Capture] Capture complete: \(result.imageData.count) bytes")
+        return result
+    }
+
+    private func performCapture() async throws -> ScreenshotResult {
         guard let screen = NSScreen.main else {
             throw CaptureError.noDisplay
         }
@@ -53,8 +72,6 @@ class ScreenCaptureService {
 
     /// Check if Screen Recording permission is granted
     func hasScreenRecordingPermission() -> Bool {
-        // TODO: Implement proper permission check
-        // CGPreflightScreenCaptureAccess() on macOS 15+
         return CGPreflightScreenCaptureAccess()
     }
 
