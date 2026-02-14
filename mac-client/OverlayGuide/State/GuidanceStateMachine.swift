@@ -7,6 +7,7 @@
 //
 // This is an ObservableObject so SwiftUI views can react to changes.
 
+import AppKit
 import Combine
 import Foundation
 
@@ -27,6 +28,7 @@ class GuidanceStateMachine: ObservableObject {
     @Published var currentPlan: StepPlan?
     @Published var currentStepIndex: Int = 0
     @Published var hintMessage: String?
+    @Published private(set) var completedSteps: [Step] = []
 
     // MARK: - Session
 
@@ -77,15 +79,42 @@ class GuidanceStateMachine: ObservableObject {
                     imageSize: ImageSize(w: Int(screenshot.screenBounds.width), h: Int(screenshot.screenBounds.height)),
                     learningProfile: session.learningProfile
                 )
-                self.currentPlan = plan
-                self.currentStepIndex = 0
-                self.session.stepPlan = plan
-                self.session.currentStepIndex = 0
-                self.addEvent(.planReceived)
-                self.phase = .guiding
+                self.applyInitialPlan(plan)
             } catch {
                 self.phase = .error(error.localizedDescription)
             }
+        }
+    }
+
+    /// External integration entry point for the first `/plan` response.
+    func applyInitialPlan(_ plan: StepPlan) {
+        currentPlan = plan
+        currentStepIndex = 0
+        completedSteps = []
+        session.stepPlan = plan
+        session.currentStepIndex = 0
+        addEvent(.planReceived)
+        phase = .guiding
+    }
+
+    /// External integration entry point for `/next` responses.
+    func applyNextPlan(_ plan: StepPlan) {
+        currentPlan = plan
+        currentStepIndex = 0
+        session.stepPlan = plan
+        session.currentStepIndex = 0
+        addEvent(.planReceived, detail: "next")
+        phase = .guiding
+    }
+
+    /// Debug integration helper: apply a raw JSON StepPlan payload from `/plan` or `/next`.
+    func applyPlanJSON(_ json: String, asNextPlan: Bool = false) throws {
+        let data = Data(json.utf8)
+        let plan = try JSONDecoder().decode(StepPlan.self, from: data)
+        if asNextPlan {
+            applyNextPlan(plan)
+        } else {
+            applyInitialPlan(plan)
         }
     }
 
@@ -108,7 +137,7 @@ class GuidanceStateMachine: ObservableObject {
         }
 
         if hitTarget != nil {
-            advanceStep()
+            handleStepCompletionFromClick()
         } else {
             addEvent(.clickMiss)
             hintMessage = "Try clicking the highlighted area"
@@ -120,10 +149,54 @@ class GuidanceStateMachine: ObservableObject {
         }
     }
 
+    /// Called when a click successfully hits the current step target.
+    /// Captures a fresh screenshot and asks `/next` for updated guidance.
+    func handleStepCompletionFromClick() {
+        guard phase == .guiding,
+              let plan = currentPlan,
+              currentStepIndex < plan.steps.count else { return }
+
+        let completedStep = plan.steps[currentStepIndex]
+        completedSteps.append(completedStep)
+        addEvent(.clickHit)
+        addEvent(.stepAdvanced)
+
+        phase = .loading
+
+        Task { @MainActor in
+            do {
+                // NOTE: we intentionally only trigger next-step refresh after a click completion,
+                // not hover or tooltip changes, to avoid false state-change detections.
+                let screenshot = try await captureService.captureMainDisplay()
+                let nextPlan = try await networkClient.requestNext(
+                    goal: session.goal,
+                    screenshotData: screenshot.imageData,
+                    imageSize: ImageSize(
+                        w: Int(screenshot.screenBounds.width),
+                        h: Int(screenshot.screenBounds.height)
+                    ),
+                    completedSteps: completedSteps,
+                    totalSteps: max(completedSteps.count, session.stepPlan?.steps.count ?? plan.steps.count),
+                    learningProfile: session.learningProfile,
+                    appContext: session.appContext
+                )
+                applyNextPlan(nextPlan)
+            } catch {
+                // Fallback to local step progression if `/next` is unavailable.
+                phase = .guiding
+                advanceStep()
+                hintMessage = "Live refresh unavailable. Continuing with existing steps."
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    self.hintMessage = nil
+                }
+            }
+        }
+    }
+
     /// Move to the next step
     func advanceStep() {
         guard let plan = currentPlan else { return }
-        addEvent(.clickHit)
         addEvent(.stepAdvanced)
 
         currentStepIndex += 1
@@ -140,6 +213,7 @@ class GuidanceStateMachine: ObservableObject {
         currentPlan = nil
         currentStepIndex = 0
         hintMessage = nil
+        completedSteps = []
         session = SessionSnapshot(
             sessionId: UUID(),
             goal: "",

@@ -21,7 +21,10 @@ class OverlayWindowController {
 
     /// Create and show overlay panels on all displays
     func showOverlay() {
-        hideAll()
+        if !panels.isEmpty {
+            updateForPhase(stateMachine.phase)
+            return
+        }
 
         for screen in NSScreen.screens {
             let panel = createPanel(for: screen)
@@ -32,12 +35,27 @@ class OverlayWindowController {
             panel.orderFrontRegardless()
             panels.append(panel)
         }
+
+        updateForPhase(stateMachine.phase)
     }
 
     /// Remove all overlay panels
     func hideAll() {
         panels.forEach { $0.close() }
         panels.removeAll()
+    }
+
+    /// Keep panel interaction in sync with app phase.
+    func updateForPhase(_ phase: GuidancePhase) {
+        let shouldPassThrough: Bool
+        switch phase {
+        case .guiding, .loading:
+            shouldPassThrough = true
+        case .idle, .inputGoal, .completed, .error:
+            shouldPassThrough = false
+        }
+
+        panels.forEach { $0.ignoresMouseEvents = shouldPassThrough }
     }
 
     // MARK: - Private
@@ -53,7 +71,7 @@ class OverlayWindowController {
         panel.backgroundColor = .clear
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.ignoresMouseEvents = false // will toggle per-step if needed
+        panel.ignoresMouseEvents = false
         panel.hasShadow = false
         return panel
     }
