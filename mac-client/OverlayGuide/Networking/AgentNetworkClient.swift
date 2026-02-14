@@ -1,5 +1,5 @@
 // Networking/AgentNetworkClient.swift
-// Owner: Eng 4 (State + Integration)
+// Owner: Eng 3 (Agent Pipeline)
 //
 // HTTP client for communicating with the Python agent-server.
 // Sends screenshots + goals, receives StepPlan JSON.

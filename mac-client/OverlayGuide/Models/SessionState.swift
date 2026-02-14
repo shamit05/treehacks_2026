@@ -1,5 +1,5 @@
 // Models/SessionState.swift
-// Owner: Eng 4 (State + Integration)
+// Owner: Eng 4 (State Machine)
 //
 // Data model for the session state. The StateMachine owns an instance of this.
 

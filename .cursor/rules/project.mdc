@@ -10,12 +10,15 @@ alwaysApply: true
 macOS system-wide AI guidance overlay. Swift frontend (SwiftUI + AppKit), Python FastAPI backend, shared JSON schema. Read `docs/spec.md` for the full spec.
 
 ## Engineer Ownership
-- **Eng 1 (Overlay UI):** `mac-client/OverlayGuide/Overlay/`, `mac-client/OverlayGuide/UI/`
-- **Eng 2 (Capture + Input):** `mac-client/OverlayGuide/Capture/`, `mac-client/OverlayGuide/Input/`
-- **Eng 3 (Agent Server):** `agent-server/`
-- **Eng 4 (State + Integration):** `mac-client/OverlayGuide/State/`, `mac-client/OverlayGuide/Networking/`, `mac-client/OverlayGuide/Models/`
 
-Shared integration surfaces: `shared/`, `mac-client/OverlayGuide/Models/`
+Each engineer has a dedicated runbook in `docs/` — read yours first.
+
+- **Eng 1 (Overlay + UI):** `mac-client/OverlayGuide/Overlay/`, `mac-client/OverlayGuide/UI/` → see `docs/eng1-overlay-ui.md`
+- **Eng 2 (Capture + Input):** `mac-client/OverlayGuide/Capture/`, `mac-client/OverlayGuide/Input/` → see `docs/eng2-capture-input.md`
+- **Eng 3 (Agent Pipeline):** `agent-server/`, `mac-client/OverlayGuide/Networking/`, `shared/` → see `docs/eng3-agent.md`
+- **Eng 4 (State Machine):** `mac-client/OverlayGuide/State/`, `mac-client/OverlayGuide/Models/`, `mac-client/OverlayGuide/App/` → see `docs/eng4-state.md`
+
+Integration surfaces: `shared/step_plan_schema.json` (Eng 3 owns), `Models/` (Eng 4 owns), `GuidanceStateMachine` (Eng 4 owns, everyone reads from it)
 
 ## Hard Rules
 

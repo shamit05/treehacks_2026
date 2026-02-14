@@ -1,5 +1,5 @@
 // State/GuidanceStateMachine.swift
-// Owner: Eng 4 (State + Integration)
+// Owner: Eng 4 (State Machine)
 //
 // Central state machine for the overlay guidance flow.
 // Owns the session state, controls step progression, and

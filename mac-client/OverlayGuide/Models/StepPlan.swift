@@ -1,5 +1,5 @@
 // Models/StepPlan.swift
-// Owner: Eng 4 (State + Integration)
+// Owner: Eng 4 (State Machine)
 //
 // Swift Codable models matching shared/step_plan_schema.json.
 // This is the single source of truth on the client side.

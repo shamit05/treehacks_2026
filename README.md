@@ -82,12 +82,14 @@ docs/
 
 ## Engineer Ownership
 
-| Engineer | Area | Directories |
-|----------|------|-------------|
-| **Eng 1** | Overlay UI | `mac-client/.../Overlay/`, `mac-client/.../UI/` |
-| **Eng 2** | Capture + Input | `mac-client/.../Capture/`, `mac-client/.../Input/` |
-| **Eng 3** | Agent Server | `agent-server/` |
-| **Eng 4** | State + Integration | `mac-client/.../State/`, `mac-client/.../Networking/`, `mac-client/.../Models/` |
+Each engineer has a detailed runbook in `docs/` — **read yours before starting**.
+
+| Engineer | Area | Directories | Runbook |
+|----------|------|-------------|---------|
+| **Eng 1** | Overlay + UI | `mac-client/.../Overlay/`, `mac-client/.../UI/` | [`docs/eng1-overlay-ui.md`](docs/eng1-overlay-ui.md) |
+| **Eng 2** | Capture + Input | `mac-client/.../Capture/`, `mac-client/.../Input/` | [`docs/eng2-capture-input.md`](docs/eng2-capture-input.md) |
+| **Eng 3** | Agent Pipeline | `agent-server/`, `mac-client/.../Networking/`, `shared/` | [`docs/eng3-agent.md`](docs/eng3-agent.md) |
+| **Eng 4** | State Machine | `mac-client/.../State/`, `mac-client/.../Models/`, `mac-client/.../App/` | [`docs/eng4-state.md`](docs/eng4-state.md) |
 
 ## Key Conventions
 
