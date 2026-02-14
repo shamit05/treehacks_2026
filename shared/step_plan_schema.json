@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/step_plan_schema.json",
+  "title": "StepPlan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "goal",
+    "image_size",
+    "steps"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema/version string for compatibility (e.g., 'v1').",
+      "pattern": "^v\\d+$"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "app_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_name"
+      ],
+      "properties": {
+        "app_name": {
+          "type": "string"
+        },
+        "bundle_id": {
+          "type": "string"
+        },
+        "window_title": {
+          "type": "string"
+        }
+      }
+    },
+    "image_size": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "w",
+        "h"
+      ],
+      "properties": {
+        "w": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "h": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "instruction",
+          "targets",
+          "advance"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "instruction": {
+            "type": "string",
+            "minLength": 1
+          },
+          "targets": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "x",
+                "y",
+                "w",
+                "h"
+              ],
+              "properties": {
+                "x": {
+                  "type": "number",
+                  "minimum": 0.0,
+                  "maximum": 1.0
+                },
+                "y": {
+                  "type": "number",
+                  "minimum": 0.0,
+                  "maximum": 1.0
+                },
+                "w": {
+                  "type": "number",
+                  "exclusiveMinimum": 0.0,
+                  "maximum": 1.0
+                },
+                "h": {
+                  "type": "number",
+                  "exclusiveMinimum": 0.0,
+                  "maximum": 1.0
+                },
+                "confidence": {
+                  "type": "number",
+                  "minimum": 0.0,
+                  "maximum": 1.0
+                },
+                "label": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "advance": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "click_in_target",
+                  "text_entered_or_next",
+                  "manual_next",
+                  "wait_for_ui_change"
+                ]
+              },
+              "notes": {
+                "type": "string"
+              }
+            }
+          },
+          "safety": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "requires_confirmation": {
+                "type": "boolean"
+              },
+              "risk_level": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

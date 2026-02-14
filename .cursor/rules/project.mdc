@@ -1,0 +1,65 @@
+---
+description: Project-wide rules for the OverlayGuide hackathon project
+globs:
+alwaysApply: true
+---
+
+# OverlayGuide — Cursor Rules
+
+## Project Overview
+macOS system-wide AI guidance overlay. Swift frontend (SwiftUI + AppKit), Python FastAPI backend, shared JSON schema. Read `docs/spec.md` for the full spec.
+
+## Engineer Ownership
+- **Eng 1 (Overlay UI):** `mac-client/OverlayGuide/Overlay/`, `mac-client/OverlayGuide/UI/`
+- **Eng 2 (Capture + Input):** `mac-client/OverlayGuide/Capture/`, `mac-client/OverlayGuide/Input/`
+- **Eng 3 (Agent Server):** `agent-server/`
+- **Eng 4 (State + Integration):** `mac-client/OverlayGuide/State/`, `mac-client/OverlayGuide/Networking/`, `mac-client/OverlayGuide/Models/`
+
+Shared integration surfaces: `shared/`, `mac-client/OverlayGuide/Models/`
+
+## Hard Rules
+
+### Architecture
+1. **Never mix UI rendering and networking in the same file.** Overlay views must not make network calls. Networking goes through the `Networking/` module.
+2. **Overlay rendering must be stateless.** The overlay reads from the state machine and renders. It does not own state. State lives in `State/`.
+3. **New features = new files/modules.** Avoid god-classes. Each protocol/service gets its own file.
+4. **All AI outputs must validate against `shared/step_plan_schema.json`.** No free-form AI responses. Both the server (Pydantic) and client (Codable) enforce this.
+
+### Coordinates
+5. **Use normalized coordinates only.** All target rects use `[0,1]` values relative to screenshot dimensions. Origin is **top-left** `(0,0)`.
+6. **No hardcoded screen sizes.** Always read `NSScreen.screens` at runtime for display bounds and scaling factor.
+
+### Networking & Async
+7. **Every async call needs a timeout.** Default: 10s for agent requests, 5s for screenshots. Provide retry logic (1 retry for agent, 0 for capture).
+8. **Log request IDs across client and server.** Generate a UUID per request on the client, send as `X-Request-ID` header, log it on both sides.
+
+### Python (agent-server)
+9. **FastAPI + Pydantic only.** All request/response models use Pydantic. Validate against the JSON schema.
+10. **Keep prompt templates in `prompts/` as text files.** Do not inline long prompts in Python code. Use string `.format()` or f-string interpolation at call time.
+11. **Always support mock mode.** `GET /health` and `POST /plan` must work with `MOCK_MODE=true` env var, returning hardcoded valid responses for demo reliability.
+
+### Swift (mac-client)
+12. **SwiftUI for views, AppKit only for window management.** Use `NSPanel` for overlay windows. SwiftUI for all content rendering.
+13. **Permission checks before capture or input taps.** Check Screen Recording permission before `ScreenCaptureKit` calls. Show clear instructions if denied.
+14. **Use `@Published` properties on an `ObservableObject` for state.** The state machine should be an `ObservableObject` that the UI observes.
+
+### General
+15. **No tests needed for hackathon.** Focus on working code. But keep functions small and single-purpose so they're easy to debug.
+16. **Keep the shared schema in sync.** If you change `shared/step_plan_schema.json`, update both `agent-server/app/schemas/step_plan.py` (Pydantic) and `mac-client/OverlayGuide/Models/StepPlan.swift` (Codable).
+17. **Commit often with descriptive messages.** Prefix with your area: `[overlay]`, `[capture]`, `[agent]`, `[state]`.
+
+## Key Data Flow
+```
+User hotkey -> InputMonitor -> StateMachine (set goal)
+  -> CaptureService (screenshot)
+  -> NetworkingClient (POST /plan with screenshot + goal)
+  -> AgentServer (returns StepPlan JSON)
+  -> StateMachine (store plan, set step 0)
+  -> OverlayController (render current step highlights)
+  -> User clicks target -> InputMonitor -> StateMachine (advance step)
+```
+
+## File Naming Conventions
+- Swift: PascalCase for types, camelCase for properties/methods. One type per file.
+- Python: snake_case for files and functions. PascalCase for Pydantic models.
+- Keep imports organized: stdlib first, third-party second, local third.
