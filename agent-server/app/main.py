@@ -1,20 +1,45 @@
 # app/main.py
-# Owner: Eng 3 (Agent Server)
+# Owner: Eng 3 (Agent Pipeline)
 #
 # FastAPI application entry point.
-# Registers routers and configures CORS for the mac-client.
+# Registers routers, loads env, configures CORS, and sets up error handling.
 
 import os
+import time
+import uuid
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from app.routers import plan
+load_dotenv()  # load .env before anything else
+
+from app.routers import plan, replan  # noqa: E402
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup / shutdown events."""
+    mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    has_key = bool(os.getenv("OPENAI_API_KEY"))
+    print(f"[server] OverlayGuide Agent Server starting")
+    print(f"[server]   MOCK_MODE={mock_mode}")
+    print(f"[server]   OPENAI_MODEL={model}")
+    print(f"[server]   OPENAI_API_KEY={'set' if has_key else 'MISSING'}")
+    if not mock_mode and not has_key:
+        print("[server]   WARNING: No API key set and mock mode is off. /plan will fail.")
+    yield
+    print("[server] Shutting down.")
+
 
 app = FastAPI(
     title="OverlayGuide Agent Server",
     description="AI agent that generates step-by-step UI guidance plans from screenshots",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 # CORS — allow the mac client to connect from localhost
@@ -26,8 +51,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Request ID + timing middleware
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    start = time.time()
+
+    response = await call_next(request)
+
+    elapsed_ms = round((time.time() - start) * 1000)
+    response.headers["X-Request-ID"] = request_id
+    print(f"[server] {request.method} {request.url.path} -> {response.status_code} ({elapsed_ms}ms) rid={request_id}")
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Global exception handler — return JSON, never HTML stacktraces
+# ---------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", "unknown")
+    print(f"[server] Unhandled error rid={request_id}: {type(exc).__name__}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "message": str(exc),
+            "request_id": request_id,
+        },
+    )
+
+
 # Register routers
 app.include_router(plan.router)
+app.include_router(replan.router)
 
 
 @app.get("/health")
@@ -37,4 +98,5 @@ async def health():
     return {
         "status": "ok",
         "mock_mode": mock_mode,
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o"),
     }
