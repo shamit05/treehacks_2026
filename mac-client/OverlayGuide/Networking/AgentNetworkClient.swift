@@ -2,8 +2,8 @@
 // Owner: Eng 3 (Agent Pipeline)
 //
 // HTTP client for communicating with the Python agent-server.
-// Sends screenshots + goals, receives StepPlan JSON.
-// Includes request IDs, timeouts, and retry logic.
+// Sends raw screenshots + goals, receives StepPlan JSON.
+// Server handles all SoM marker generation and refinement.
 
 import Foundation
 
@@ -11,8 +11,8 @@ class AgentNetworkClient {
 
     private let baseURL: URL
     private let session: URLSession
-    // Model calls can take >10s on real screenshots; use a higher client timeout.
-    private let timeout: TimeInterval = 35.0
+    // SoM two-pass pipeline can take 10-15s; use generous timeout.
+    private let timeout: TimeInterval = 60.0
 
     init(baseURL: URL = URL(string: "http://localhost:8000")!) {
         self.baseURL = baseURL
@@ -22,11 +22,11 @@ class AgentNetworkClient {
         self.session = URLSession(configuration: config)
     }
 
-    /// POST /plan — send goal + screenshot, receive StepPlan
+    /// POST /plan — send goal + raw screenshot, receive StepPlan with refined targets.
+    /// Server handles SoM marker generation, model calls, and refinement.
     func requestPlan(
         goal: String,
-        screenshotWithMarkersData: Data,
-        markers: [SOMMarker],
+        screenshotData: Data,
         imageSize: ImageSize,
         learningProfile: LearningProfile? = nil,
         appContext: AppContext? = nil
@@ -35,116 +35,38 @@ class AgentNetworkClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
 
-        // Request ID for debugging
         let requestId = UUID().uuidString
         request.setValue(requestId, forHTTPHeaderField: "X-Request-ID")
         print("[Network] POST /plan requestId=\(requestId)")
 
-        // Build multipart form data
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         var body = Data()
 
-        // Goal field
         body.appendMultipart(name: "goal", value: goal, boundary: boundary)
 
-        // Image size field
         let imageSizeJSON = try JSONEncoder().encode(imageSize)
         body.appendMultipart(name: "image_size", value: String(data: imageSizeJSON, encoding: .utf8)!, boundary: boundary)
 
-        // Learning profile field (optional)
         if let profile = learningProfile {
             body.appendMultipart(name: "learning_profile", value: profile.text, boundary: boundary)
         }
 
-        // App context field (optional)
         if let context = appContext {
             let contextJSON = try JSONEncoder().encode(context)
             body.appendMultipart(name: "app_context", value: String(data: contextJSON, encoding: .utf8)!, boundary: boundary)
         }
 
-        // Markers JSON field
-        let markersJSON = try JSONEncoder().encode(markers)
-        body.appendMultipart(name: "markers_json", value: String(data: markersJSON, encoding: .utf8)!, boundary: boundary)
+        // Raw screenshot — server draws markers and handles refinement
+        body.appendMultipartFile(name: "screenshot", filename: "screenshot.png", mimeType: "image/png", data: screenshotData, boundary: boundary)
 
-        // Marked screenshot file
-        body.appendMultipartFile(
-            name: "screenshot_with_markers",
-            filename: "screenshot_with_markers.png",
-            mimeType: "image/png",
-            data: screenshotWithMarkersData,
-            boundary: boundary
-        )
-
-        // Close boundary
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-
         request.httpBody = body
 
-        // Send request with 1 retry
         let data = try await sendWithRetry(request: request, maxRetries: 1)
-
         let plan = try JSONDecoder().decode(StepPlan.self, from: data)
         return plan
-    }
-
-    /// POST /refine — send crop + context, receive crop-normalized bbox.
-    func requestRefine(
-        goal: String,
-        stepId: String,
-        instruction: String,
-        cropImageData: Data,
-        cropRectFullNorm: CropRectNorm,
-        sessionSummary: String? = nil
-    ) async throws -> TargetRect {
-        let url = baseURL.appendingPathComponent("refine")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-
-        let requestId = UUID().uuidString
-        request.setValue(requestId, forHTTPHeaderField: "X-Request-ID")
-        print("[Network] POST /refine requestId=\(requestId)")
-
-        let boundary = UUID().uuidString
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        var body = Data()
-
-        body.appendMultipart(name: "goal", value: goal, boundary: boundary)
-        body.appendMultipart(name: "step_id", value: stepId, boundary: boundary)
-        body.appendMultipart(name: "instruction", value: instruction, boundary: boundary)
-
-        let cropRectJSON = try JSONEncoder().encode(cropRectFullNorm)
-        body.appendMultipart(
-            name: "crop_rect_full_norm",
-            value: String(data: cropRectJSON, encoding: .utf8)!,
-            boundary: boundary
-        )
-        if let sessionSummary {
-            body.appendMultipart(name: "session_summary", value: sessionSummary, boundary: boundary)
-        }
-        body.appendMultipartFile(
-            name: "crop_image",
-            filename: "crop_image.png",
-            mimeType: "image/png",
-            data: cropImageData,
-            boundary: boundary
-        )
-        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-        request.httpBody = body
-
-        let data = try await sendWithRetry(request: request, maxRetries: 1)
-        let refined = try JSONDecoder().decode(RefineBBoxResponse.self, from: data)
-        return TargetRect(
-            type: .bboxNorm,
-            markerId: nil,
-            x: refined.x,
-            y: refined.y,
-            w: refined.w,
-            h: refined.h,
-            confidence: refined.confidence,
-            label: refined.label
-        )
     }
 
     /// POST /next — send fresh screenshot + completed steps, receive updated StepPlan
@@ -161,51 +83,39 @@ class AgentNetworkClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
 
-        // Request ID for debugging
         let requestId = UUID().uuidString
         request.setValue(requestId, forHTTPHeaderField: "X-Request-ID")
         print("[Network] POST /next requestId=\(requestId)")
 
-        // Build multipart form data
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         var body = Data()
 
-        // Goal field
         body.appendMultipart(name: "goal", value: goal, boundary: boundary)
 
-        // Image size field
         let imageSizeJSON = try JSONEncoder().encode(imageSize)
         body.appendMultipart(name: "image_size", value: String(data: imageSizeJSON, encoding: .utf8)!, boundary: boundary)
 
-        // Completed steps field (JSON array)
         let completedStepsJSON = try JSONEncoder().encode(completedSteps)
         body.appendMultipart(name: "completed_steps", value: String(data: completedStepsJSON, encoding: .utf8)!, boundary: boundary)
 
-        // Total steps field
         body.appendMultipart(name: "total_steps", value: String(totalSteps), boundary: boundary)
 
-        // Learning profile field (optional)
         if let profile = learningProfile {
             body.appendMultipart(name: "learning_profile", value: profile.text, boundary: boundary)
         }
 
-        // App context field (optional)
         if let context = appContext {
             let contextJSON = try JSONEncoder().encode(context)
             body.appendMultipart(name: "app_context", value: String(data: contextJSON, encoding: .utf8)!, boundary: boundary)
         }
 
-        // Fresh screenshot file
         body.appendMultipartFile(name: "screenshot", filename: "screenshot.png", mimeType: "image/png", data: screenshotData, boundary: boundary)
 
-        // Close boundary
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-
         request.httpBody = body
 
-        // Send request with 1 retry
         let data = try await sendWithRetry(request: request, maxRetries: 1)
         let plan = try JSONDecoder().decode(StepPlan.self, from: data)
         return plan
@@ -227,7 +137,6 @@ class AgentNetworkClient {
             } catch {
                 lastError = error
                 if attempt < maxRetries {
-                    // Brief backoff before retry
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     print("[Network] Retrying... attempt \(attempt + 1)")
                 }
@@ -236,15 +145,6 @@ class AgentNetworkClient {
 
         throw lastError ?? NetworkError.unknown
     }
-}
-
-private struct RefineBBoxResponse: Codable {
-    let x: Double
-    let y: Double
-    let w: Double
-    let h: Double
-    let confidence: Double?
-    let label: String?
 }
 
 // MARK: - Errors

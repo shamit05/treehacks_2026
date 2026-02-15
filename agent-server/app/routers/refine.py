@@ -10,7 +10,7 @@ import os
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
-from app.schemas.step_plan import CropRect, RefineResponse, TargetRect
+from app.schemas.step_plan import CropRect, RefineResponse, TargetRect, TargetType
 from app.services.agent import AgentError, generate_refine
 
 router = APIRouter()
@@ -32,6 +32,7 @@ def _stitch_back(crop_bbox: RefineResponse, crop_rect: CropRect) -> TargetRect:
     h = max(0.001, min(h, 1.0 - y))
 
     return TargetRect(
+        type=TargetType.bbox_norm,
         x=x,
         y=y,
         w=w,
@@ -74,6 +75,7 @@ async def refine_target(
     if mock_mode:
         # Return center of crop as the target
         return TargetRect(
+            type=TargetType.bbox_norm,
             x=parsed_crop.cx + 0.3 * parsed_crop.cw,
             y=parsed_crop.cy + 0.3 * parsed_crop.ch,
             w=0.4 * parsed_crop.cw,

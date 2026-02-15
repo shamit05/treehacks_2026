@@ -157,8 +157,9 @@ class GlobalInputMonitor {
             return
         }
         lastHotkeyAt = Date()
-        NSApp.activate(ignoringOtherApps: true)
-        stateMachine.showInputOverlay()
+        // Do NOT activate OverlayGuide — the target app should stay active
+        // so its menu bar remains visible and screenshots capture it correctly.
+        stateMachine.toggleOverlay()
     }
 
     // MARK: - Mouse Click Detection

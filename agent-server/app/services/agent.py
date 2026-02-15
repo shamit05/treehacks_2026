@@ -13,17 +13,13 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
-<<<<<<< Current (Your changes)
-from app.schemas.step_plan import BBoxNorm, ImageSize
-from app.schemas.step_plan import StepPlan
-=======
 from app.schemas.step_plan import (
+    BBoxNorm,
     ImageSize,
     RefineResponse,
     SoMStepPlan,
     StepPlan,
 )
->>>>>>> Incoming (Background Agent changes)
 
 # ---------------------------------------------------------------------------
 # Prompt templates

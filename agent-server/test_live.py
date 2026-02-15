@@ -215,18 +215,6 @@ def test_plan(goal: str, use_som: bool = True) -> dict | None:
     # Send to /plan
     print("[4/4] Sending to /plan...")
     start = time.time()
-<<<<<<< Current (Your changes)
-    markers_json = json.dumps(build_grid_markers())
-    resp = httpx.post(
-        f"{SERVER_URL}/plan",
-        data={
-            "goal": goal,
-            "image_size": f'{{"w":{w},"h":{h}}}',
-            "markers_json": markers_json,
-        },
-        files={
-            "screenshot_with_markers": ("screenshot_with_markers.png", png_bytes, "image/png"),
-=======
 
     form_data = {
         "goal": goal,
@@ -240,7 +228,6 @@ def test_plan(goal: str, use_som: bool = True) -> dict | None:
         data=form_data,
         files={
             "screenshot": ("screenshot.png", screenshot_to_send, "image/png"),
->>>>>>> Incoming (Background Agent changes)
         },
         headers={"X-Request-ID": f"test-live-{mode.lower()}"},
         timeout=60,

@@ -7,12 +7,13 @@ YOUR TASK:
 1. Look at the cropped image and find the UI element described below.
 2. Select ALL marker IDs whose circles overlap or cover that element.
 
-MULTI-MARKER SELECTION:
-- For a small button or icon: select 1 marker (the closest one).
-- For a wider element: select multiple markers spanning its width.
-- For a tall element: select multiple markers spanning its height.
-- For a large element: select all markers that cover it.
-- The markers you select will define the highlighted bounding box. Select enough to fully cover the element.
+MARKER SELECTION — BE PRECISE:
+- Select the MINIMUM number of markers needed to cover the element. Do NOT over-select.
+- Small button or single word (e.g. "File", a gear icon): select exactly 1 marker.
+- Medium element (e.g. a 2-3 word button like "Save As..."): select 2 markers.
+- Wide element (e.g. a search bar, text field): select 3-5 markers spanning its width.
+- Large area: select markers covering it, but no more than needed.
+- IMPORTANT: the bounding box is drawn around all selected markers. Every extra marker makes the box bigger and less precise.
 
 RULES:
 1) Output ONLY valid JSON. No markdown, no extra text.

@@ -29,11 +29,11 @@ class RiskLevel(str, Enum):
     high = "high"
 
 
-<<<<<<< Current (Your changes)
 class TargetType(str, Enum):
     som_marker = "som_marker"
     bbox_norm = "bbox_norm"
-=======
+
+
 # ---------------------------------------------------------------------------
 # Shared / leaf models (no forward references)
 # ---------------------------------------------------------------------------
@@ -46,7 +46,6 @@ class ImageSize(BaseModel):
     h: int = Field(..., ge=1)
 
     model_config = {"extra": "forbid"}
->>>>>>> Incoming (Background Agent changes)
 
 
 class TargetRect(BaseModel):

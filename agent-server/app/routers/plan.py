@@ -15,14 +15,15 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from PIL import Image, ImageDraw, ImageFont
 
 from app.schemas.step_plan import (
+    CropRect,
     ImageSize,
     SoMMarker,
     SoMStepPlan,
     Step,
     StepPlan,
     TargetRect,
+    TargetType,
 )
-from app.schemas.step_plan import CropRect
 from app.services.agent import AgentError, generate_plan, generate_som_plan, generate_som_refine
 from app.services.mock import get_mock_plan
 
@@ -157,6 +158,7 @@ def _som_plan_to_step_plan(
                 id=som_step.id,
                 instruction=som_step.instruction,
                 targets=[TargetRect(
+                    type=TargetType.bbox_norm,
                     x=0.4, y=0.4, w=0.2, h=0.2,
                     confidence=0.1,
                     label="fallback — marker not found",
@@ -185,6 +187,7 @@ def _som_plan_to_step_plan(
         h = max(h, 0.02)
 
         targets = [TargetRect(
+            type=TargetType.bbox_norm,
             x=x, y=y, w=w, h=h,
             confidence=avg_conf if avg_conf > 0 else None,
             label=label,
@@ -376,11 +379,12 @@ async def _refine_plan_two_pass(
                 rw = min(max_x - min_x + pad * 2, 1.0 - rx)
                 rh = min(max_y - min_y + pad * 2, 1.0 - ry)
 
-                # Ensure minimum size — at least ~50x40 pixels on a 1512x982 screen
-                rw = max(rw, 0.035)
-                rh = max(rh, 0.035)
+                # Ensure minimum size — at least ~40x30 pixels on a 1512x982 screen
+                rw = max(rw, 0.025)
+                rh = max(rh, 0.025)
 
                 refined = TargetRect(
+                    type=TargetType.bbox_norm,
                     x=rx, y=ry, w=rw, h=rh,
                     confidence=result.get("confidence"),
                     label=result.get("label"),
