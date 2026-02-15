@@ -5,15 +5,14 @@
 # Receives a goal + screenshot, returns a StepPlan JSON.
 # Supports MOCK_MODE for demo reliability.
 #
-# Pipeline options (controlled by USE_OMNIPARSER env var):
-#   OmniParser (default): screenshot → OmniParser → element list → LLM → StepPlan
-#   SoM (legacy):         screenshot → grid markers → LLM → two-pass refine → StepPlan
+# Pipeline: Screenshot → YOLO full image → annotated screenshot → single Gemini call → StepPlan
 
 import io
 import json
 import os
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
 
 from app.schemas.step_plan import (
@@ -27,14 +26,7 @@ from app.schemas.step_plan import (
     TargetRect,
     TargetType,
 )
-from app.services.agent import (
-    AgentError,
-    generate_omniparser_plan,
-    generate_omniparser_refine,
-    generate_plan,
-    generate_som_plan,
-    generate_som_refine,
-)
+from app.services.agent import AgentError
 from app.services.mock import get_mock_plan
 from app.services.omniparser import (
     OmniElement,
@@ -43,6 +35,7 @@ from app.services.omniparser import (
     draw_numbered_boxes,
     format_elements_context,
     parse_screenshot as omniparser_parse,
+    snap_to_nearest_element,
 )
 
 router = APIRouter()
@@ -667,6 +660,7 @@ async def _refine_with_omniparser(
                     crop_image_bytes=annotated_crop,
                     elements_context=elements_ctx,
                     request_id=request_id,
+                    raw_crop_bytes=crop_bytes,
                 )
 
                 picked_ids = result.get("element_ids", [])
@@ -692,15 +686,23 @@ async def _refine_with_omniparser(
                 full_x2 = crop_rect.cx + max(all_x2) * crop_rect.cw
                 full_y2 = crop_rect.cy + max(all_y2) * crop_rect.ch
 
-                # Clamp to [0,1]
-                rx = max(0.0, full_x1)
-                ry = max(0.0, full_y1)
-                rw = min(full_x2 - full_x1, 1.0 - rx)
-                rh = min(full_y2 - full_y1, 1.0 - ry)
+                # Guard against inverted coordinates (bad YOLO detection)
+                if full_x2 <= full_x1 or full_y2 <= full_y1:
+                    print(f"[hybrid] rid={request_id} step={step.id} inverted bbox, keeping coarse")
+                    refined_targets.append(target)
+                    continue
 
-                # Ensure minimum size
-                rw = max(rw, 0.02)
-                rh = max(rh, 0.02)
+                # Clamp origin to [0,1]
+                rx = max(0.0, min(full_x1, 1.0))
+                ry = max(0.0, min(full_y1, 1.0))
+
+                # Compute width/height from the actual bbox extent
+                rw = max(full_x2 - full_x1, 0.02)
+                rh = max(full_y2 - full_y1, 0.02)
+
+                # Clamp so bbox stays within [0,1]
+                rw = min(rw, 1.0 - rx)
+                rh = min(rh, 1.0 - ry)
 
                 refined = TargetRect(
                     type=TargetType.bbox_norm,
@@ -747,21 +749,11 @@ async def create_plan(
     """
     Generate a step-by-step guidance plan from a goal and screenshot.
 
-    Hybrid pipeline (default, USE_OMNIPARSER=true):
-      Screenshot → SOM coarse grid (8x5) → LLM picks region
-      → crop → OmniParser YOLO (precise elements) → LLM picks element → StepPlan
-
-    SoM-only pipeline (legacy, USE_OMNIPARSER=false):
-      Screenshot → SOM grid (8x5) → LLM → two-pass sub-grid refinement → StepPlan
+    Pipeline: Screenshot → YOLO full image → annotated screenshot → single Gemini call → StepPlan
+    One YOLO pass + one LLM call. No SOM grid, no cropping, no refinement.
     """
     request_id = getattr(request.state, "request_id", "unknown")
-
-    use_omniparser = os.getenv("USE_OMNIPARSER", "true").lower() == "true"
-    # Legacy SoM fallback: only when OmniParser is disabled and markers_json != "none"
-    use_som = not use_omniparser and markers_json != "none"
-
-    pipeline = "hybrid" if use_omniparser else ("som" if use_som else "legacy")
-    print(f"[plan] rid={request_id} goal={goal!r} pipeline={pipeline}")
+    print(f"[plan] rid={request_id} goal={goal!r} pipeline=gemini-oneshot")
 
     # --- Parse and validate image_size ---
     try:
@@ -785,185 +777,319 @@ async def create_plan(
 
     print(f"[plan] rid={request_id} screenshot={len(screenshot_bytes)} bytes, size={parsed_size.w}x{parsed_size.h}")
 
-    # --- Generate plan via AI ---
-    # Max 2 LLM calls:
-    #   Call 1: YOLO full screen → LLM generates plan + picks elements
-    #   Call 2 (only if step 1 has low confidence): crop → YOLO → LLM refines step 1
-    # Steps beyond step 1 always use the fast-path bbox — they'll be
-    # re-planned via /next when the user completes each step anyway.
-    _REFINE_CONFIDENCE = 0.5
+    # Helper: save a debug image to /tmp with a numbered prefix
+    _debug_step = [0]
+
+    def _dbg(filename: str, data: bytes, info: str = ""):
+        _debug_step[0] += 1
+        path = f"/tmp/og_{_debug_step[0]:02d}_{filename}.png"
+        try:
+            with open(path, "wb") as f:
+                f.write(data)
+            print(f"[plan] rid={request_id} saved {path} ({len(data)} bytes) {info}")
+        except Exception as e:
+            print(f"[plan] rid={request_id} failed to save {path}: {e}")
 
     try:
-        if use_omniparser:
-            # ===== Call 1: YOLO full screen → LLM picks elements =====
-            print(f"[plan] rid={request_id} YOLO on full screen...")
-            full_elements = detect_elements(screenshot_bytes)
-            print(f"[plan] rid={request_id} YOLO detected {len(full_elements)} elements")
+        # ===== STEP 1: Save original screenshot =====
+        _dbg("original_screenshot", screenshot_bytes,
+             f"{parsed_size.w}x{parsed_size.h}")
 
-            annotated_full = draw_numbered_boxes(screenshot_bytes, full_elements)
-            try:
-                with open("/tmp/overlayguide_fast_annotated.png", "wb") as f:
-                    f.write(annotated_full)
-            except Exception:
-                pass
+        # ===== STEP 2: YOLO on full screenshot =====
+        elements = detect_elements(screenshot_bytes)
+        print(f"[plan] rid={request_id} YOLO detected {len(elements)} elements on full screenshot")
 
-            elements_ctx = format_elements_context(full_elements)
-            omni_plan = await generate_omniparser_plan(
-                goal=goal,
-                image_size=parsed_size,
-                annotated_screenshot_bytes=annotated_full,
-                elements_context=elements_ctx,
-                learning_profile=learning_profile,
-                app_context=app_context,
-                session_summary=session_summary,
-                request_id=request_id,
-            )
+        # Sort by position (top-to-bottom, left-to-right) and renumber
+        elements.sort(key=lambda e: (e.bbox_xyxy[1], e.bbox_xyxy[0]))
+        for i, e in enumerate(elements):
+            e.id = i
 
-            plan = _omni_plan_to_step_plan(omni_plan, full_elements)
+        # ===== STEP 3: Draw numbered boxes on screenshot =====
+        annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
+        _dbg("yolo_annotated", annotated_bytes,
+             f"{len(elements)} elements")
 
-            for i, (omni_step, step) in enumerate(zip(omni_plan.steps, plan.steps)):
-                conf = omni_step.confidence or 0.0
-                for t in step.targets:
-                    print(f"[plan] rid={request_id} step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) conf={conf:.2f} label={t.label!r}")
+        elements_ctx = format_elements_context(elements)
+        print(f"[plan] rid={request_id} elements:\n{elements_ctx}")
 
-            # ===== Call 2 (optional): refine ONLY step 1 if low confidence =====
-            if plan.steps and omni_plan.steps:
-                first_conf = omni_plan.steps[0].confidence or 0.0
-                first_step = plan.steps[0]
-                first_target = first_step.targets[0] if first_step.targets else None
+        # ===== STEP 4: Single Gemini call — one-shot plan =====
+        from app.services.agent import generate_gemini_plan
+        result = await generate_gemini_plan(
+            goal=goal,
+            annotated_screenshot_bytes=annotated_bytes,
+            raw_screenshot_bytes=screenshot_bytes,
+            elements_context=elements_ctx,
+            request_id=request_id,
+        )
 
-                if first_conf < _REFINE_CONFIDENCE and first_target and first_target.x is not None:
-                    print(f"[plan] rid={request_id} step 1 conf={first_conf:.2f} < {_REFINE_CONFIDENCE} — refining via crop...")
-                    try:
-                        crop_rect, crop_bytes = _crop_region(screenshot_bytes, first_target)
-                        print(f"[plan] rid={request_id} crop=({crop_rect.cx:.3f},{crop_rect.cy:.3f},{crop_rect.cw:.3f},{crop_rect.ch:.3f})")
+        # ===== STEP 5: Convert Gemini response → StepPlan =====
+        elem_map = {e.id: e for e in elements}
+        converted_steps: list[Step] = []
 
-                        crop_elements = detect_elements(crop_bytes)
-                        print(f"[plan] rid={request_id} YOLO detected {len(crop_elements)} elements in crop")
+        for step_data in result.get("steps", []):
+            step_id = step_data.get("id", f"s{len(converted_steps) + 1}")
+            instruction = step_data.get("instruction", "")
+            label = step_data.get("label")
+            confidence = step_data.get("confidence", 0.5)
+            advance_type = step_data.get("advance", "click_in_target")
 
-                        if crop_elements:
-                            annotated_crop = draw_numbered_boxes(crop_bytes, crop_elements)
-                            try:
-                                with open("/tmp/overlayguide_refine_crop.png", "wb") as f:
-                                    f.write(annotated_crop)
-                            except Exception:
-                                pass
+            # Try to get bbox from Gemini's native box_2d [ymin, xmin, ymax, xmax] / 1000
+            box_2d = step_data.get("box_2d")
+            element_id = step_data.get("element_id")
 
-                            crop_ctx = format_elements_context(crop_elements)
-                            result = await generate_omniparser_refine(
-                                instruction=first_step.instruction,
-                                target_label=first_target.label or "",
-                                crop_image_bytes=annotated_crop,
-                                elements_context=crop_ctx,
-                                request_id=request_id,
-                            )
+            rx, ry, rw, rh = None, None, None, None
 
-                            picked_ids = result.get("element_ids", [])
-                            elem_map = {e.id: e for e in crop_elements}
-                            found = [elem_map[eid] for eid in picked_ids if eid in elem_map]
+            if box_2d and len(box_2d) == 4:
+                ymin, xmin, ymax, xmax = box_2d
+                rx = xmin / 1000.0
+                ry = ymin / 1000.0
+                rw = (xmax - xmin) / 1000.0
+                rh = (ymax - ymin) / 1000.0
+                print(f"[plan] rid={request_id} step={step_id} Gemini box_2d={box_2d} -> ({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
 
-                            if found:
-                                all_x1 = [e.bbox_xyxy[0] for e in found]
-                                all_y1 = [e.bbox_xyxy[1] for e in found]
-                                all_x2 = [e.bbox_xyxy[2] for e in found]
-                                all_y2 = [e.bbox_xyxy[3] for e in found]
+                # Snap to nearest YOLO element for pixel-precise bbox
+                sx, sy, sw, sh, snap_id = snap_to_nearest_element(rx, ry, rw, rh, elements)
+                if snap_id is not None:
+                    print(f"[plan] rid={request_id} step={step_id} SNAPPED to YOLO elem[{snap_id}]=({sx:.3f},{sy:.3f},{sw:.3f},{sh:.3f})")
+                    rx, ry, rw, rh = sx, sy, sw, sh
 
-                                rx = max(0.0, crop_rect.cx + min(all_x1) * crop_rect.cw)
-                                ry = max(0.0, crop_rect.cy + min(all_y1) * crop_rect.ch)
-                                rw = max((max(all_x2) - min(all_x1)) * crop_rect.cw, 0.02)
-                                rh = max((max(all_y2) - min(all_y1)) * crop_rect.ch, 0.02)
-                                rw = min(rw, 1.0 - rx)
-                                rh = min(rh, 1.0 - ry)
+            # If Gemini referenced an element_id directly, use YOLO bbox
+            if rx is None and element_id is not None and element_id in elem_map:
+                elem = elem_map[element_id]
+                rx, ry, rw, rh = elem.bbox_xywh
+                print(f"[plan] rid={request_id} step={step_id} YOLO elem[{element_id}]=({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
 
-                                refined_step = Step(
-                                    id=first_step.id,
-                                    instruction=first_step.instruction,
-                                    targets=[TargetRect(
-                                        type=TargetType.bbox_norm,
-                                        x=rx, y=ry, w=rw, h=rh,
-                                        confidence=result.get("confidence"),
-                                        label=result.get("label"),
-                                    )],
-                                    advance=first_step.advance,
-                                    safety=first_step.safety,
-                                )
-                                # Replace step 1 with refined version
-                                plan = StepPlan(
-                                    version=plan.version,
-                                    goal=plan.goal,
-                                    image_size=plan.image_size,
-                                    steps=[refined_step] + list(plan.steps[1:]),
-                                )
-                                print(f"[plan] rid={request_id} step 1 REFINED ({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f}) label={result.get('label')!r}")
-                    except Exception as e:
-                        print(f"[plan] rid={request_id} step 1 refine failed: {e}, keeping fast-path bbox")
-                else:
-                    print(f"[plan] rid={request_id} step 1 conf={first_conf:.2f} — no refine needed")
+            # Fallback: center of screen
+            if rx is None:
+                rx, ry, rw, rh = 0.4, 0.4, 0.2, 0.2
+                print(f"[plan] rid={request_id} step={step_id} FALLBACK center-of-screen")
 
-            for step in plan.steps:
-                for t in step.targets:
-                    print(f"[plan] rid={request_id} FINAL: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
+            # Clamp
+            rx = max(0.0, min(rx, 1.0))
+            ry = max(0.0, min(ry, 1.0))
+            rw = max(0.02, min(rw, 1.0 - rx))
+            rh = max(0.02, min(rh, 1.0 - ry))
 
-        elif use_som:
-            # ----- SoM pipeline (legacy) -----
-            markers, marked_screenshot = _generate_markers_and_image(screenshot_bytes)
+            from app.schemas.step_plan import Advance, AdvanceType
+            advance_map = {
+                "click_in_target": AdvanceType.click_in_target,
+                "text_entered_or_next": AdvanceType.text_entered_or_next,
+                "manual_next": AdvanceType.manual_next,
+                "wait_for_ui_change": AdvanceType.wait_for_ui_change,
+            }
 
-            # Save marked screenshot for debugging
-            try:
-                with open("/tmp/overlayguide_server_marked.png", "wb") as f:
-                    f.write(marked_screenshot)
-            except Exception:
-                pass
+            converted_steps.append(Step(
+                id=step_id,
+                instruction=instruction,
+                targets=[TargetRect(
+                    type=TargetType.bbox_norm,
+                    x=rx, y=ry, w=rw, h=rh,
+                    confidence=confidence,
+                    label=label,
+                )],
+                advance=Advance(type=advance_map.get(advance_type, AdvanceType.click_in_target)),
+            ))
 
-            som_plan = await generate_som_plan(
-                goal=goal,
-                image_size=parsed_size,
-                screenshot_bytes=marked_screenshot,
-                learning_profile=learning_profile,
-                app_context=app_context,
-                session_summary=session_summary,
-                request_id=request_id,
-            )
+        plan = StepPlan(
+            version="v1",
+            goal=goal,
+            image_size=parsed_size,
+            steps=converted_steps,
+        )
 
-            # Log what the model picked
-            marker_map = {m.id: m for m in markers}
-            for step in som_plan.steps:
-                for st in step.som_targets:
-                    m = marker_map.get(st.marker_id)
-                    if m:
-                        print(f"[plan] rid={request_id} MARKER PICK: step={step.id} marker_id={st.marker_id} -> ({m.cx:.3f},{m.cy:.3f}) conf={st.confidence} label={st.label!r}")
-                    else:
-                        print(f"[plan] rid={request_id} MARKER PICK: step={step.id} marker_id={st.marker_id} -> NOT FOUND!")
+        # ===== FINAL: draw final bbox on original screenshot =====
+        _save_bbox_debug(screenshot_bytes, plan,
+                         lambda d: _dbg("FINAL_overlay", d), color=(0, 220, 50))
 
-            plan = _som_plan_to_step_plan(som_plan, markers)
+        for step in plan.steps:
+            for t in step.targets:
+                print(f"[plan] rid={request_id} FINAL: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
 
-            for step in plan.steps:
-                for t in step.targets:
-                    print(f"[plan] rid={request_id} MARKER TARGET: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
-
-            # Two-pass SoM: dense sub-grid on zoomed crop
-            plan = await _refine_plan_two_pass(plan, screenshot_bytes, request_id)
-
-            for step in plan.steps:
-                for t in step.targets:
-                    print(f"[plan] rid={request_id} REFINED TARGET: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
-        else:
-            # ----- Legacy pipeline: model outputs raw coordinates -----
-            plan = await generate_plan(
-                goal=goal,
-                image_size=parsed_size,
-                screenshot_bytes=screenshot_bytes,
-                learning_profile=learning_profile,
-                app_context=app_context,
-                session_summary=session_summary,
-                request_id=request_id,
-            )
     except AgentError as e:
         print(f"[plan] rid={request_id} agent error: {e}")
         raise HTTPException(status_code=502, detail=f"Agent failed: {e}")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[plan] rid={request_id} unexpected error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
-    print(f"[plan] rid={request_id} success, {len(plan.steps)} steps (pipeline={pipeline})")
+    print(f"[plan] rid={request_id} success, {len(plan.steps)} steps (pipeline=gemini-oneshot)")
     return plan
+
+
+# ---------------------------------------------------------------------------
+# Streaming endpoint: /plan-stream (SSE)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/plan-stream")
+async def create_plan_stream(
+    request: Request,
+    goal: str = Form(...),
+    image_size: str = Form(...),
+    screenshot: UploadFile = File(...),
+    learning_profile: str = Form(None),
+    app_context: str = Form(None),
+    session_summary: str = Form(None),
+    markers_json: str = Form(None),
+):
+    """
+    Streaming version of /plan. Returns newline-delimited JSON (NDJSON):
+      Line 1: {"type":"instruction","text":"Click on..."} — as soon as instruction is available
+      Line 2: {"type":"plan","data":{...full StepPlan...}} — when complete
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    print(f"[plan-stream] rid={request_id} goal={goal!r}")
+
+    try:
+        size_dict = json.loads(image_size)
+        parsed_size = ImageSize.model_validate(size_dict)
+    except (json.JSONDecodeError, Exception) as e:
+        raise HTTPException(status_code=422, detail=f"Invalid image_size JSON: {e}")
+
+    screenshot_bytes = await screenshot.read()
+    if len(screenshot_bytes) == 0:
+        raise HTTPException(status_code=422, detail="Screenshot file is empty")
+
+    async def event_stream():
+        try:
+            # YOLO on full screenshot
+            elements = detect_elements(screenshot_bytes)
+            elements.sort(key=lambda e: (e.bbox_xyxy[1], e.bbox_xyxy[0]))
+            for i, e in enumerate(elements):
+                e.id = i
+
+            annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
+            elements_ctx = format_elements_context(elements)
+            elem_map = {e.id: e for e in elements}
+
+            # Stream Gemini response
+            from app.services.agent import generate_gemini_plan_stream
+
+            full_result = None
+            async for event in generate_gemini_plan_stream(
+                goal=goal,
+                annotated_screenshot_bytes=annotated_bytes,
+                raw_screenshot_bytes=screenshot_bytes,
+                elements_context=elements_ctx,
+                request_id=request_id,
+            ):
+                if event["type"] == "instruction":
+                    yield json.dumps({"type": "instruction", "text": event["text"]}) + "\n"
+
+                elif event["type"] == "plan":
+                    full_result = event["data"]
+
+            if full_result is None:
+                yield json.dumps({"type": "error", "message": "No plan generated"}) + "\n"
+                return
+
+            # Convert Gemini result → StepPlan (same logic as /plan)
+            from app.schemas.step_plan import Advance, AdvanceType
+            advance_map = {
+                "click_in_target": AdvanceType.click_in_target,
+                "text_entered_or_next": AdvanceType.text_entered_or_next,
+                "manual_next": AdvanceType.manual_next,
+                "wait_for_ui_change": AdvanceType.wait_for_ui_change,
+            }
+
+            converted_steps = []
+            for step_data in full_result.get("steps", []):
+                step_id = step_data.get("id", f"s{len(converted_steps) + 1}")
+                instruction = step_data.get("instruction", "")
+                label = step_data.get("label")
+                confidence = step_data.get("confidence", 0.5)
+                advance_type = step_data.get("advance", "click_in_target")
+
+                box_2d = step_data.get("box_2d")
+                element_id = step_data.get("element_id")
+                rx, ry, rw, rh = None, None, None, None
+
+                if box_2d and len(box_2d) == 4:
+                    ymin, xmin, ymax, xmax = box_2d
+                    rx = xmin / 1000.0
+                    ry = ymin / 1000.0
+                    rw = (xmax - xmin) / 1000.0
+                    rh = (ymax - ymin) / 1000.0
+                    sx, sy, sw, sh, snap_id = snap_to_nearest_element(rx, ry, rw, rh, elements)
+                    if snap_id is not None:
+                        rx, ry, rw, rh = sx, sy, sw, sh
+
+                if rx is None and element_id is not None and element_id in elem_map:
+                    rx, ry, rw, rh = elem_map[element_id].bbox_xywh
+
+                if rx is None:
+                    rx, ry, rw, rh = 0.4, 0.4, 0.2, 0.2
+
+                rx = max(0.0, min(rx, 1.0))
+                ry = max(0.0, min(ry, 1.0))
+                rw = max(0.02, min(rw, 1.0 - rx))
+                rh = max(0.02, min(rh, 1.0 - ry))
+
+                converted_steps.append(Step(
+                    id=step_id,
+                    instruction=instruction,
+                    targets=[TargetRect(type=TargetType.bbox_norm, x=rx, y=ry, w=rw, h=rh, confidence=confidence, label=label)],
+                    advance=Advance(type=advance_map.get(advance_type, AdvanceType.click_in_target)),
+                ))
+
+            plan = StepPlan(version="v1", goal=goal, image_size=parsed_size, steps=converted_steps)
+            plan_json = plan.model_dump()
+            yield json.dumps({"type": "plan", "data": plan_json}) + "\n"
+
+            print(f"[plan-stream] rid={request_id} done, {len(plan.steps)} steps")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+def _save_bbox_debug(
+    screenshot_bytes: bytes,
+    plan: StepPlan,
+    save_fn,
+    color: tuple[int, int, int] = (0, 200, 50),
+) -> None:
+    """Draw all target bounding boxes on the original screenshot and pass bytes to save_fn."""
+    try:
+        img = Image.open(io.BytesIO(screenshot_bytes)).convert("RGB")
+        actual_w, actual_h = img.size
+        draw = ImageDraw.Draw(img)
+
+        font_size = max(18, actual_w // 90)
+        border_width = max(3, actual_w // 400)
+
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        for step_idx, step in enumerate(plan.steps):
+            for t in step.targets:
+                if t.x is None or t.y is None or t.w is None or t.h is None:
+                    continue
+                x1 = int(t.x * actual_w)
+                y1 = int(t.y * actual_h)
+                x2 = int((t.x + t.w) * actual_w)
+                y2 = int((t.y + t.h) * actual_h)
+
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=border_width)
+
+                label = f"Step {step_idx + 1}: {t.label or step.instruction[:40]}"
+                lbbox = draw.textbbox((0, 0), label, font=font)
+                lw = lbbox[2] - lbbox[0] + 12
+                lh = lbbox[3] - lbbox[1] + 8
+                lx = max(0, x1)
+                ly = max(0, y1 - lh - 2)
+                draw.rectangle([lx, ly, lx + lw, ly + lh], fill=color)
+                draw.text((lx + 6, ly + 4), label, fill=(255, 255, 255), font=font)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        save_fn(buf.getvalue())
+    except Exception as e:
+        print(f"[plan] _save_bbox_debug failed: {e}")

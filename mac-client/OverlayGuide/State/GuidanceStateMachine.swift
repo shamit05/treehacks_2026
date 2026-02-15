@@ -90,14 +90,16 @@ class GuidanceStateMachine: ObservableObject {
 
         Task { @MainActor in
             do {
-                // Give the window system a brief moment to remove overlay windows.
-                try? await Task.sleep(nanoseconds: 150_000_000)
+                // Give the window system a moment to fully remove overlay windows.
+                try? await Task.sleep(nanoseconds: 200_000_000)
 
-                loadingStatus = "Capturing screen..."
-                self.phase = .loading
-
+                // Capture FIRST, before showing any loading UI
                 let screenshot = try await captureService.captureMainDisplay()
                 self.capturedScreenBounds = screenshot.screenBounds
+
+                // NOW show loading UI (after screenshot is captured clean)
+                loadingStatus = "Analyzing screen..."
+                self.phase = .loading
                 let imgSize = ImageSize(
                     w: Int(screenshot.screenBounds.width),
                     h: Int(screenshot.screenBounds.height)
@@ -105,21 +107,23 @@ class GuidanceStateMachine: ObservableObject {
 
                 saveDebugArtifacts(goal: goal, screenshotData: screenshot.imageData)
 
-                loadingStatus = "Analyzing UI elements..."
+                loadingStatus = "Analyzing screen..."
 
                 // Progressive status updates while waiting
                 Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 2_500_000_000)
-                    if self.phase == .loading { self.loadingStatus = "Creating plan..." }
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    if self.phase == .loading { self.loadingStatus = "Generating overlays..." }
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    if self.phase == .loading { self.loadingStatus = "Almost ready..." }
                 }
 
-                let plan = try await networkClient.requestPlan(
+                let plan = try await networkClient.requestPlanStream(
                     goal: goal,
                     screenshotData: screenshot.imageData,
                     imageSize: imgSize,
-                    learningProfile: session.learningProfile
+                    learningProfile: session.learningProfile,
+                    onInstruction: { [weak self] instruction in
+                        // Show instruction text immediately (before bbox arrives)
+                        self?.loadingStatus = instruction
+                    }
                 )
 
                 self.applyInitialPlan(plan)
@@ -264,33 +268,42 @@ class GuidanceStateMachine: ObservableObject {
         }
 
         if hitTarget != nil {
-            handleStepCompletionFromClick()
+            addEvent(.clickHit)
+            let completedStep = plan.steps[currentStepIndex]
+            completedSteps.append(completedStep)
+            // Only trigger /next when the user clicks the highlighted target.
+            // Ignore random clicks elsewhere so we don't waste API calls.
+            requestNextAfterClick()
         } else {
+            // Click outside the target — ignore silently.
+            // Don't show a hint or call /next, the user is just interacting
+            // with their app normally.
             addEvent(.clickMiss)
-            hintMessage = "Try clicking the highlighted area"
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                self.hintMessage = nil
-            }
         }
     }
 
-    /// Called when a click successfully hits the current step target.
-    func handleStepCompletionFromClick() {
+    /// After any click, wait for UI to update, then capture and ask the server.
+    ///
+    /// IMPORTANT: We must NOT change phase or show any overlay UI before
+    /// capturing the screenshot, because:
+    /// 1. Changing phase triggers overlay window updates which defocus the target app
+    /// 2. Overlay windows would appear in the screenshot
+    /// So the sequence is: hide overlay → wait for click effect → capture → show loading → call /next
+    private func requestNextAfterClick() {
         guard phase == .guiding,
-              let plan = currentPlan,
-              currentStepIndex < plan.steps.count else { return }
+              let plan = currentPlan else { return }
 
-        let completedStep = plan.steps[currentStepIndex]
-        completedSteps.append(completedStep)
-        addEvent(.clickHit)
-        addEvent(.stepAdvanced)
-
-        loadingStatus = "Processing next step..."
-        phase = .loading
+        // Step 1: Go to idle to hide ALL overlay windows before capture.
+        // This ensures the screenshot is clean (no overlay, no defocus).
+        phase = .idle
 
         Task { @MainActor in
             do {
+                // Step 2: Wait for overlay to disappear + click effect to render.
+                // 150ms for windows to hide + 350ms for UI change (menu open, dialog, etc.)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+
+                // Step 3: Capture clean screenshot (no overlay windows visible)
                 let screenshot = try await captureService.captureMainDisplay()
                 self.capturedScreenBounds = screenshot.screenBounds
                 let imgSize = ImageSize(
@@ -298,6 +311,14 @@ class GuidanceStateMachine: ObservableObject {
                     h: Int(screenshot.screenBounds.height)
                 )
 
+                // Save for debugging
+                try? screenshot.imageData.write(to: URL(fileURLWithPath: "/tmp/overlayguide_next_screenshot.png"))
+
+                // Step 4: NOW show loading UI (after screenshot is captured)
+                loadingStatus = "Analyzing..."
+                phase = .loading
+
+                // Step 5: Call /next with the clean screenshot
                 let nextResponse = try await networkClient.requestNext(
                     goal: session.goal,
                     screenshotData: screenshot.imageData,
@@ -309,10 +330,9 @@ class GuidanceStateMachine: ObservableObject {
                 )
                 applyNextResponse(nextResponse)
             } catch {
-                // Fallback to local step progression
+                // Fallback: go back to guiding with current plan
                 phase = .guiding
-                advanceStep()
-                hintMessage = "Live refresh unavailable. Continuing with existing steps."
+                hintMessage = "Connection issue. Try again."
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     self.hintMessage = nil

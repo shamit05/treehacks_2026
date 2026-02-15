@@ -24,11 +24,15 @@ async def lifespan(app: FastAPI):
     """Startup / shutdown events."""
     mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
     model = os.getenv("OPENAI_MODEL", "gpt-4o")
-    has_key = bool(os.getenv("OPENAI_API_KEY"))
+    gemini_key = bool(os.getenv("GEMINI_API_KEY"))
+    openai_key = bool(os.getenv("OPENAI_API_KEY"))
+    openrouter_key = bool(os.getenv("OPENROUTER_API_KEY"))
+    provider = "Gemini" if gemini_key else ("OpenAI" if openai_key else ("OpenRouter" if openrouter_key else "NONE"))
+    has_key = gemini_key or openai_key or openrouter_key
     print(f"[server] OverlayGuide Agent Server starting")
     print(f"[server]   MOCK_MODE={mock_mode}")
-    print(f"[server]   OPENAI_MODEL={model}")
-    print(f"[server]   OPENAI_API_KEY={'set' if has_key else 'MISSING'}")
+    print(f"[server]   PROVIDER={provider}")
+    print(f"[server]   MODEL={model}")
     if not mock_mode and not has_key:
         print("[server]   WARNING: No API key set and mock mode is off. /plan will fail.")
     yield

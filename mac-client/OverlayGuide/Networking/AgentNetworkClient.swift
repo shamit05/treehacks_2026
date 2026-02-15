@@ -22,50 +22,71 @@ class AgentNetworkClient {
         self.session = URLSession(configuration: config)
     }
 
-    /// POST /plan — send goal + raw screenshot, receive StepPlan with refined targets.
-    /// Server handles SoM marker generation, model calls, and refinement.
-    func requestPlan(
+    /// POST /plan-stream — streaming version that yields instruction text early, then full plan.
+    /// Calls onInstruction as soon as the instruction text is available (before bbox).
+    /// Returns the full StepPlan when complete.
+    func requestPlanStream(
         goal: String,
         screenshotData: Data,
         imageSize: ImageSize,
         learningProfile: LearningProfile? = nil,
-        appContext: AppContext? = nil
+        appContext: AppContext? = nil,
+        onInstruction: @escaping (String) -> Void
     ) async throws -> StepPlan {
-        let url = baseURL.appendingPathComponent("plan")
+        let url = baseURL.appendingPathComponent("plan-stream")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
 
         let requestId = UUID().uuidString
         request.setValue(requestId, forHTTPHeaderField: "X-Request-ID")
-        print("[Network] POST /plan requestId=\(requestId)")
+        print("[Network] POST /plan-stream requestId=\(requestId)")
 
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         var body = Data()
-
         body.appendMultipart(name: "goal", value: goal, boundary: boundary)
-
         let imageSizeJSON = try JSONEncoder().encode(imageSize)
         body.appendMultipart(name: "image_size", value: String(data: imageSizeJSON, encoding: .utf8)!, boundary: boundary)
-
         if let profile = learningProfile {
             body.appendMultipart(name: "learning_profile", value: profile.text, boundary: boundary)
         }
-
         if let context = appContext {
             let contextJSON = try JSONEncoder().encode(context)
             body.appendMultipart(name: "app_context", value: String(data: contextJSON, encoding: .utf8)!, boundary: boundary)
         }
-
-        // Raw screenshot — server draws markers and handles refinement
         body.appendMultipartFile(name: "screenshot", filename: "screenshot.png", mimeType: "image/png", data: screenshotData, boundary: boundary)
-
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         request.httpBody = body
 
-        let data = try await sendWithRetry(request: request, maxRetries: 1)
-        let plan = try JSONDecoder().decode(StepPlan.self, from: data)
+        // Read streaming NDJSON response
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw NetworkError.badResponse
+        }
+
+        var planData: Data?
+        for try await line in bytes.lines {
+            guard !line.isEmpty else { continue }
+            guard let lineData = line.data(using: .utf8),
+                  let event = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let type = event["type"] as? String else { continue }
+
+            if type == "instruction", let text = event["text"] as? String {
+                print("[Network] Stream: instruction=\(text)")
+                await MainActor.run { onInstruction(text) }
+            } else if type == "plan", let data = event["data"] {
+                planData = try JSONSerialization.data(withJSONObject: data)
+            } else if type == "error", let message = event["message"] as? String {
+                throw NetworkError.serverError(message)
+            }
+        }
+
+        guard let planData else {
+            throw NetworkError.badResponse
+        }
+        let plan = try JSONDecoder().decode(StepPlan.self, from: planData)
         return plan
     }
 
@@ -153,12 +174,14 @@ enum NetworkError: Error, LocalizedError {
     case badResponse
     case timeout
     case unknown
+    case serverError(String)
 
     var errorDescription: String? {
         switch self {
         case .badResponse: return "Bad response from agent server"
         case .timeout: return "Agent server request timed out"
         case .unknown: return "Unknown network error"
+        case .serverError(let msg): return "Server error: \(msg)"
         }
     }
 }

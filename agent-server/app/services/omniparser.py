@@ -136,11 +136,13 @@ def detect_elements(
         tmp_path = tmp.name
 
     try:
+        # Use 1024px for better detection of small UI elements on Retina displays.
+        # Default 640px loses too many menu items, small buttons, and icons.
         results = model.predict(
             source=tmp_path,
             conf=box_threshold,
             iou=iou_threshold,
-            imgsz=640,
+            imgsz=1024,
             verbose=False,
         )
 
@@ -157,15 +159,28 @@ def detect_elements(
 
         elements: list[OmniElement] = []
         for i, (conf, bbox) in enumerate(raw_elements):
-            # Describe location on screen to help the LLM match visually
+            # Describe location and size to help the LLM match visually
             cx = (bbox[0] + bbox[2]) / 2
             cy = (bbox[1] + bbox[3]) / 2
+            w_norm = bbox[2] - bbox[0]
+            h_norm = bbox[3] - bbox[1]
             loc = _describe_location(cx, cy)
+
+            # Classify element size to help LLM distinguish buttons from icons etc.
+            area = w_norm * h_norm
+            if area < 0.001:
+                size = "tiny"
+            elif area < 0.005:
+                size = "small"
+            elif area < 0.02:
+                size = "medium"
+            else:
+                size = "large"
 
             elements.append(OmniElement(
                 id=i,
                 type="icon",
-                content=f"{loc} (conf={conf:.2f})",
+                content=f"{loc}, {size} element (conf={conf:.2f})",
                 bbox_xyxy=bbox,
                 interactivity=True,
             ))
@@ -196,9 +211,10 @@ def draw_numbered_boxes(
     actual_w, actual_h = img.size
     draw = ImageDraw.Draw(img)
 
-    # Scale font size based on image resolution
-    font_size = max(12, actual_w // 150)
-    border_width = max(2, actual_w // 800)
+    # Medium font — readable after OpenAI downscaling but not overwhelming.
+    # On 3024px image: font=34px, border=4px.
+    font_size = max(18, actual_w // 90)
+    border_width = max(3, actual_w // 600)
 
     try:
         font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
@@ -229,20 +245,20 @@ def draw_numbered_boxes(
         # Draw bounding box
         draw.rectangle([x1, y1, x2, y2], outline=color, width=border_width)
 
-        # Draw number label with background
+        # Draw number label with big, bold background
         label = str(elem.id)
         label_bbox = draw.textbbox((0, 0), label, font=font)
-        lw = label_bbox[2] - label_bbox[0] + 6
-        lh = label_bbox[3] - label_bbox[1] + 4
+        lw = label_bbox[2] - label_bbox[0] + 12
+        lh = label_bbox[3] - label_bbox[1] + 8
 
         # Position label at top-left of bbox
         lx = max(0, x1)
         ly = max(0, y1 - lh - 2)
         if ly < 0:
-            ly = y1  # below top edge if no room above
+            ly = y1
 
         draw.rectangle([lx, ly, lx + lw, ly + lh], fill=color)
-        draw.text((lx + 3, ly + 2), label, fill=(255, 255, 255), font=font)
+        draw.text((lx + 6, ly + 4), label, fill=(255, 255, 255), font=font)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -400,6 +416,48 @@ async def _parse_via_gradio(
 
 
 # ---------------------------------------------------------------------------
+# Snap Gemini box_2d to nearest YOLO element
+# ---------------------------------------------------------------------------
+
+
+def snap_to_nearest_element(
+    gemini_x: float, gemini_y: float, gemini_w: float, gemini_h: float,
+    elements: list[OmniElement],
+    max_distance: float = 0.04,
+) -> tuple[float, float, float, float, int | None]:
+    """
+    Find the YOLO element whose center is closest to the center of Gemini's
+    bounding box.  If within max_distance, return the YOLO element's bbox
+    (more precise).  Otherwise return the original Gemini coords.
+
+    Returns (x, y, w, h, matched_element_id).
+    """
+    if not elements:
+        return gemini_x, gemini_y, gemini_w, gemini_h, None
+
+    gcx = gemini_x + gemini_w / 2
+    gcy = gemini_y + gemini_h / 2
+
+    best_elem = None
+    best_dist = float("inf")
+
+    for elem in elements:
+        ex, ey, ew, eh = elem.bbox_xywh
+        ecx = ex + ew / 2
+        ecy = ey + eh / 2
+        dist = ((gcx - ecx) ** 2 + (gcy - ecy) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_elem = elem
+
+    if best_elem is not None and best_dist <= max_distance:
+        ex, ey, ew, eh = best_elem.bbox_xywh
+        return ex, ey, ew, eh, best_elem.id
+
+    return gemini_x, gemini_y, gemini_w, gemini_h, None
+
+
+# ---------------------------------------------------------------------------
 # Element context formatting
 # ---------------------------------------------------------------------------
 
@@ -408,6 +466,7 @@ def format_elements_context(elements: list[OmniElement]) -> str:
     """
     Format OmniParser elements into a text context string for the LLM prompt.
     Each element is listed with its ID, type, content, and bbox.
+    The ID matches the numbered box drawn on the annotated screenshot.
     """
     if not elements:
         return "(no elements detected)"
@@ -415,9 +474,8 @@ def format_elements_context(elements: list[OmniElement]) -> str:
     lines = []
     for e in elements:
         x, y, w, h = e.bbox_xywh
-        interactable = "interactive" if e.interactivity else "static"
         lines.append(
-            f"  [{e.id}] {e.type} ({interactable}): \"{e.content}\" "
+            f"  [Box {e.id}] \"{e.content}\" "
             f"— bbox(x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f})"
         )
     return "\n".join(lines)

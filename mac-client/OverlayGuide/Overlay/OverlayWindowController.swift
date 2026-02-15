@@ -62,14 +62,14 @@ class OverlayWindowController {
     /// Hide all overlay panels. Keeps the window alive so SwiftUI state is preserved.
     func hideAll() {
         window?.orderOut(nil)
-        hideHighlightPanels()
+        destroyHighlightPanels()
     }
 
     /// Fully destroy all panels (called on app quit).
     func destroyAll() {
         window?.close()
         window = nil
-        hideHighlightPanels()
+        destroyHighlightPanels()
     }
 
     // MARK: - Private
@@ -131,15 +131,6 @@ class OverlayWindowController {
     }
 
     private func updateHighlightPanels(for phase: GuidancePhase) {
-        // Show highlights during guiding AND loading (grayed out during loading)
-        switch phase {
-        case .guiding, .loading:
-            break
-        default:
-            hideHighlightPanels()
-            return
-        }
-
         let targetBounds = stateMachine.capturedScreenBounds
             ?? NSScreen.main?.frame
             ?? NSScreen.screens.first?.frame
@@ -154,22 +145,33 @@ class OverlayWindowController {
             )
             panel.isOpaque = false
             panel.backgroundColor = .clear
-            panel.level = .statusBar
+            // .screenSaver is the highest window level — renders above menu bar, Dock, etc.
+            panel.level = .screenSaver
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             panel.ignoresMouseEvents = true
             panel.hasShadow = false
+            panel.contentView = NSHostingView(
+                rootView: HighlightOverlayView(stateMachine: stateMachine, screenBounds: targetBounds)
+            )
             highlightPanel = panel
         }
 
         guard let highlightPanel else { return }
-        highlightPanel.setFrame(targetBounds, display: true)
-        highlightPanel.contentView = NSHostingView(
-            rootView: HighlightOverlayView(stateMachine: stateMachine, screenBounds: targetBounds)
-        )
+
+        // Update frame if screen bounds changed (e.g. after new screenshot capture)
+        if highlightPanel.frame != targetBounds {
+            highlightPanel.setFrame(targetBounds, display: true)
+            // Update the SwiftUI view's screenBounds binding
+            highlightPanel.contentView = NSHostingView(
+                rootView: HighlightOverlayView(stateMachine: stateMachine, screenBounds: targetBounds)
+            )
+        }
+
         highlightPanel.orderFrontRegardless()
     }
 
-    private func hideHighlightPanels() {
+    /// Fully tear down the highlight panel (called by hideAll / destroyAll).
+    private func destroyHighlightPanels() {
         highlightPanel?.close()
         highlightPanel = nil
     }

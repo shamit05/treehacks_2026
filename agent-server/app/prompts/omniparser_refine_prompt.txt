@@ -1,25 +1,23 @@
-SYSTEM:
-You are a precise UI element picker. You receive a ZOOMED CROP of a macOS screen with detected UI elements drawn as colored numbered bounding boxes.
+You are looking at a ZOOMED CROP of a macOS screen. The image has colored numbered bounding boxes drawn around detected UI elements. Each box has a NUMBER LABEL — that number IS the element_id.
 
-TASK:
-The user needs to: {{INSTRUCTION}}
-Target hint: "{{TARGET_LABEL}}"
+THE USER NEEDS TO: {{INSTRUCTION}}
+TARGET HINT: "{{TARGET_LABEL}}"
 
-INSTRUCTIONS:
-1. Look at the ANNOTATED IMAGE. You will see numbered colored bounding boxes drawn around detected UI elements.
-2. Find the box that best covers the element described in the task above.
-3. Return its element_id (the number shown on the box).
-4. If the exact element isn't visible in the crop but you can see a box near where it should be, pick the closest one. Do NOT return an empty list just because labels don't match — USE THE IMAGE.
-5. If truly no boxes are near the target area, return an empty list.
-
-DETECTED ELEMENTS (for reference — use the IMAGE as primary guide):
+DETECTED ELEMENTS (each element has a numbered box visible in the image):
 {{ELEMENTS_CONTEXT}}
 
-SCHEMA:
-{
-  "element_ids": [<int>, ...],
-  "confidence": <float 0-1>,
-  "label": "<brief name of the element>"
-}
+STEPS:
+1. Read the instruction and target hint carefully.
+2. Look at the image — find the UI element that matches the instruction.
+3. Match it to the numbered bounding box drawn on it. The number on the box = element_id.
+4. If the target spans multiple boxes, include all their IDs.
+5. If you can't find an exact match, pick the closest element and set confidence below 0.5.
 
-Output JSON only.
+IMPORTANT:
+- Focus on matching the visible TEXT or ICON in the image to the instruction.
+- The numbered boxes in the image correspond exactly to the element list above.
+- Prefer elements with text labels that match the instruction over positional guessing.
+- If there's a menu item, button, or text field that matches, select THAT specific element.
+
+Output JSON ONLY (no markdown, no explanation):
+{"element_ids": [<int>], "confidence": <float 0-1>, "label": "<what the element actually says>"}

@@ -47,19 +47,61 @@ _OMNI_PLAN_PROMPT_TEMPLATE = _OMNI_PLAN_PROMPT_PATH.read_text()
 _OMNI_REFINE_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "omniparser_refine_prompt.txt"
 _OMNI_REFINE_PROMPT_TEMPLATE = _OMNI_REFINE_PROMPT_PATH.read_text()
 
+_GEMINI_PLAN_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "gemini_plan_prompt.txt"
+_GEMINI_PLAN_PROMPT_TEMPLATE = _GEMINI_PLAN_PROMPT_PATH.read_text()
+
+_GEMINI_NEXT_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "gemini_next_prompt.txt"
+_GEMINI_NEXT_PROMPT_TEMPLATE = _GEMINI_NEXT_PROMPT_PATH.read_text()
+
 # ---------------------------------------------------------------------------
-# OpenAI client (lazy singleton)
+# LLM client (lazy singleton) — supports Gemini, OpenAI, and OpenRouter
 # ---------------------------------------------------------------------------
 _client: AsyncOpenAI | None = None
 
 
 def _get_client() -> AsyncOpenAI:
+    """
+    Create the LLM client.  Priority order:
+
+    1. Gemini (best vision): set GEMINI_API_KEY.
+       Uses Google's OpenAI-compatible endpoint.
+       Model names: gemini-2.5-pro, gemini-2.5-flash, etc.
+
+    2. OpenAI: set OPENAI_API_KEY.
+
+    3. OpenRouter: set OPENROUTER_API_KEY.
+       Model names: openai/gpt-4o, anthropic/claude-sonnet-4, etc.
+    """
     global _client
-    if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise AgentError("OPENAI_API_KEY environment variable is not set")
-        _client = AsyncOpenAI(api_key=api_key)
+    if _client is not None:
+        return _client
+
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+
+    if gemini_key:
+        _client = AsyncOpenAI(
+            api_key=gemini_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+        model = os.getenv("OPENAI_MODEL", "gemini-2.5-pro")
+        print(f"[agent] Using Gemini via OpenAI-compat endpoint (model={model})")
+    elif openai_key:
+        _client = AsyncOpenAI(api_key=openai_key)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        print(f"[agent] Using direct OpenAI (model={model})")
+    elif openrouter_key:
+        _client = AsyncOpenAI(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+        model = os.getenv("OPENAI_MODEL", "openai/gpt-4o")
+        print(f"[agent] Using OpenRouter (model={model})")
+    else:
+        raise AgentError(
+            "No API key found. Set GEMINI_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY in .env"
+        )
     return _client
 
 
@@ -117,15 +159,34 @@ def _extract_json(raw: str) -> dict:
 def _model_params(model: str, max_tokens: int) -> dict:
     """
     Return API kwargs adapted for the model.
-    Some models (gpt-5-mini, o-series) require max_completion_tokens
-    instead of max_tokens, and only support temperature=1.
+    Handles OpenAI o-series, OpenRouter model slugs, etc.
     """
-    # Models that need the new-style parameters
-    new_style = any(tag in model.lower() for tag in ["gpt-5", "o1", "o3", "o4"])
+    m = model.lower()
+    # Models that need the new-style parameters (o-series, gpt-5)
+    new_style = any(tag in m for tag in ["gpt-5", "o1", "o3", "o4"])
     if new_style:
         return {"max_completion_tokens": max_tokens, "temperature": 1}
     else:
         return {"max_tokens": max_tokens, "temperature": 0.1}
+
+
+def _supports_json_mode(model: str) -> bool:
+    """Check if the model supports response_format: json_object."""
+    m = model.lower()
+    # OpenAI models that support it
+    if any(tag in m for tag in ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "gpt-5"]):
+        return True
+    # OpenRouter prefixed OpenAI models
+    if "openai/" in m:
+        return True
+    # Google Gemini supports it
+    if "gemini" in m:
+        return True
+    # Anthropic Claude does NOT support response_format
+    if "claude" in m or "anthropic/" in m:
+        return False
+    # Default: try it (OpenRouter will error if unsupported)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +202,13 @@ async def _call_llm_with_backoff(client, model: str, messages: list, params: dic
     """
     Call the LLM with rate-limit-aware retry and backoff.
     Uses a semaphore to avoid piling up concurrent requests.
+    Automatically handles response_format support per model.
     """
+    # Only use json_object mode for models that support it
+    extra_kwargs = {}
+    if _supports_json_mode(model):
+        extra_kwargs["response_format"] = {"type": "json_object"}
+
     async with _llm_semaphore:
         for attempt in range(1 + MAX_RETRIES):
             try:
@@ -150,7 +217,7 @@ async def _call_llm_with_backoff(client, model: str, messages: list, params: dic
                     model=model,
                     messages=messages,
                     **params,
-                    response_format={"type": "json_object"},
+                    **extra_kwargs,
                 )
                 raw_text = response.choices[0].message.content or ""
                 print(f"[agent] rid={request_id} {label} response length={len(raw_text)}")
@@ -784,10 +851,12 @@ async def generate_omniparser_refine(
     crop_image_bytes: bytes,
     elements_context: str,
     request_id: str = "",
+    raw_crop_bytes: bytes | None = None,
 ) -> dict:
     """
     Given a zoomed crop with OmniParser-detected elements, ask the LLM
     to pick which element_id(s) match the target.
+    Sends both raw crop (for reading text) and annotated crop (for box numbers).
     Returns dict with element_ids (list[int]), confidence, label.
     """
     client = _get_client()
@@ -797,25 +866,24 @@ async def generate_omniparser_refine(
     prompt = prompt.replace("{{TARGET_LABEL}}", target_label or "")
     prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context)
 
-    crop_b64 = base64.b64encode(crop_image_bytes).decode("utf-8")
-
-    # Use the fast model for refine — simple element-picking task
-    model = os.getenv("OPENAI_NEXT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o"))
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{crop_b64}",
-                        "detail": "high",
-                    },
-                },
-            ],
-        }
+    # Send the ANNOTATED crop (with numbered boxes) so the LLM can see
+    # which element_id maps to which box, plus the raw crop so it can
+    # read actual text labels on the UI underneath.
+    annotated_b64 = base64.b64encode(crop_image_bytes).decode("utf-8")
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated_b64}", "detail": "high"}},
     ]
+    # Also send the raw (unannotated) crop so the LLM can read text beneath the boxes
+    if raw_crop_bytes:
+        raw_b64 = base64.b64encode(raw_crop_bytes).decode("utf-8")
+        content.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}}
+        )
+
+    # Use the main model for refine — accuracy matters here
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    messages = [{"role": "user", "content": content}]
 
     raw_text = await _call_llm_with_backoff(
         client, model, messages, _model_params(model, 500),
@@ -833,4 +901,166 @@ async def generate_omniparser_refine(
         raise AgentError("omni-refine response missing element_ids")
 
     print(f"[agent] rid={request_id} omni-refine picked element_ids={ids} conf={result.get('confidence')} label={result.get('label')!r}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Gemini one-shot: full screenshot → YOLO elements → single LLM call → plan
+# ---------------------------------------------------------------------------
+
+
+async def generate_gemini_plan(
+    goal: str,
+    annotated_screenshot_bytes: bytes,
+    raw_screenshot_bytes: bytes,
+    elements_context: str,
+    request_id: str = "",
+) -> dict:
+    """
+    One-shot plan generation optimized for Gemini's native vision + GUI grounding.
+    Sends both annotated (numbered boxes) and raw screenshot.
+    Returns dict with steps, each containing box_2d [ymin, xmin, ymax, xmax] on 0-1000 scale.
+    """
+    client = _get_client()
+
+    prompt = _GEMINI_PLAN_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context or "(no elements detected)")
+
+    # Send annotated screenshot (numbered boxes) + raw screenshot (readable text)
+    annotated_b64 = base64.b64encode(annotated_screenshot_bytes).decode("utf-8")
+    raw_b64 = base64.b64encode(raw_screenshot_bytes).decode("utf-8")
+
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated_b64}", "detail": "high"}},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}},
+    ]
+
+    model = os.getenv("OPENAI_MODEL", "gemini-3-pro-preview")
+    messages = [{"role": "user", "content": content}]
+
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 2000),
+        request_id, "gemini-plan"
+    )
+    result = _extract_json(raw_text)
+    print(f"[agent] rid={request_id} gemini-plan: {len(result.get('steps', []))} steps")
+    return result
+
+
+async def generate_gemini_plan_stream(
+    goal: str,
+    annotated_screenshot_bytes: bytes,
+    raw_screenshot_bytes: bytes,
+    elements_context: str,
+    request_id: str = "",
+):
+    """
+    Streaming version of generate_gemini_plan.
+    Yields partial results as they arrive:
+      1. {"type": "instruction", "text": "..."} — as soon as instruction is found
+      2. {"type": "plan", "data": {...}} — full parsed JSON when complete
+    """
+    client = _get_client()
+
+    prompt = _GEMINI_PLAN_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context or "(no elements detected)")
+
+    annotated_b64 = base64.b64encode(annotated_screenshot_bytes).decode("utf-8")
+    raw_b64 = base64.b64encode(raw_screenshot_bytes).decode("utf-8")
+
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated_b64}", "detail": "high"}},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}},
+    ]
+
+    model = os.getenv("OPENAI_MODEL", "gemini-3-pro-preview")
+    params = _model_params(model, 2000)
+
+    extra_kwargs = {}
+    if _supports_json_mode(model):
+        extra_kwargs["response_format"] = {"type": "json_object"}
+
+    print(f"[agent] rid={request_id} gemini-plan-stream model={model}")
+
+    buffer = ""
+    instruction_sent = False
+
+    async with _llm_semaphore:
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            stream=True,
+            **params,
+            **extra_kwargs,
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                buffer += delta.content
+
+                # Try to extract instruction early from partial JSON
+                if not instruction_sent and '"instruction"' in buffer:
+                    import re
+                    m = re.search(r'"instruction"\s*:\s*"([^"]*)"', buffer)
+                    if m:
+                        instruction_sent = True
+                        yield {"type": "instruction", "text": m.group(1)}
+
+    # Full response complete — parse and yield
+    print(f"[agent] rid={request_id} gemini-plan-stream complete, length={len(buffer)}")
+    result = _extract_json(buffer)
+    yield {"type": "plan", "data": result}
+
+
+# ---------------------------------------------------------------------------
+# Gemini one-shot next step
+# ---------------------------------------------------------------------------
+
+
+async def generate_gemini_next(
+    goal: str,
+    annotated_screenshot_bytes: bytes,
+    raw_screenshot_bytes: bytes,
+    elements_context: str,
+    completed_steps_summary: str,
+    num_completed: int,
+    total_steps: int,
+    request_id: str = "",
+) -> dict:
+    """
+    Given a fresh screenshot after the user completed a step, ask Gemini
+    what to do next (continue / done / retry).
+    """
+    client = _get_client()
+
+    prompt = _GEMINI_NEXT_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{NUM_COMPLETED}}", str(num_completed))
+    prompt = prompt.replace("{{TOTAL_STEPS}}", str(total_steps))
+    prompt = prompt.replace("{{COMPLETED_STEPS}}", completed_steps_summary or "none yet")
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context or "(no elements detected)")
+
+    annotated_b64 = base64.b64encode(annotated_screenshot_bytes).decode("utf-8")
+    raw_b64 = base64.b64encode(raw_screenshot_bytes).decode("utf-8")
+
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated_b64}", "detail": "high"}},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}},
+    ]
+
+    model = os.getenv("OPENAI_MODEL", "gemini-3-pro-preview")
+    messages = [{"role": "user", "content": content}]
+
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 2000),
+        request_id, "gemini-next"
+    )
+    result = _extract_json(raw_text)
+    print(f"[agent] rid={request_id} gemini-next: status={result.get('status')} steps={len(result.get('steps', []))}")
     return result

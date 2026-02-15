@@ -247,13 +247,18 @@ class GlobalInputMonitor {
                 guard let refcon = refcon else { return Unmanaged.passRetained(event) }
                 let monitor = Unmanaged<GlobalInputMonitor>.fromOpaque(refcon).takeUnretainedValue()
                 let location = event.location
-                GlobalInputMonitor.debugLog("CLICK at (\(location.x), \(location.y)) phase=\(monitor.stateMachine.phase)")
-                DispatchQueue.main.async {
-                    if case .guiding = monitor.stateMachine.phase {
+
+                // Capture phase NOW (on the event tap thread) — don't wait for main queue
+                // because the phase might change between now and the async dispatch.
+                let currentPhase = monitor.stateMachine.phase
+                GlobalInputMonitor.debugLog("CLICK at (\(location.x), \(location.y)) phase=\(currentPhase)")
+
+                if case .guiding = currentPhase {
+                    DispatchQueue.main.async {
                         monitor.stateMachine.handleClick(at: location)
-                    } else {
-                        GlobalInputMonitor.debugLog("  -> ignored (not in .guiding phase)")
                     }
+                } else {
+                    GlobalInputMonitor.debugLog("  -> ignored (not in .guiding phase)")
                 }
                 return Unmanaged.passRetained(event)
             },
