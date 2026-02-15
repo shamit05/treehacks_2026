@@ -15,6 +15,7 @@ class OverlayWindowController {
 
     private let stateMachine: GuidanceStateMachine
     private var window: NSWindow?
+    private var highlightPanels: [NSPanel] = []
     private let popupSize = NSSize(width: 460, height: 320)
 
     init(stateMachine: GuidanceStateMachine) {
@@ -50,6 +51,7 @@ class OverlayWindowController {
         hostingView.layer?.masksToBounds = true
         window.contentView = hostingView
         applyInteraction(for: phase, window: window)
+        updateHighlightPanels(for: phase)
     }
 
     /// Remove popup window.
@@ -57,6 +59,7 @@ class OverlayWindowController {
         window?.orderOut(nil)
         window?.close()
         window = nil
+        hideHighlightPanels()
     }
 
     // MARK: - Private
@@ -114,5 +117,49 @@ class OverlayWindowController {
         case .idle:
             window.orderOut(nil)
         }
+    }
+
+    private func updateHighlightPanels(for phase: GuidancePhase) {
+        guard case .guiding = phase else {
+            hideHighlightPanels()
+            return
+        }
+
+        if highlightPanels.isEmpty {
+            for screen in NSScreen.screens {
+                let panel = NSPanel(
+                    contentRect: screen.frame,
+                    styleMask: [.borderless, .nonactivatingPanel],
+                    backing: .buffered,
+                    defer: false
+                )
+                panel.isOpaque = false
+                panel.backgroundColor = .clear
+                panel.level = .statusBar
+                panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+                panel.ignoresMouseEvents = true
+                panel.hasShadow = false
+
+                panel.contentView = NSHostingView(
+                    rootView: HighlightOverlayView(stateMachine: stateMachine, screenBounds: screen.frame)
+                )
+                panel.orderFrontRegardless()
+                highlightPanels.append(panel)
+            }
+        } else {
+            for (idx, screen) in NSScreen.screens.enumerated() where idx < highlightPanels.count {
+                let panel = highlightPanels[idx]
+                panel.setFrame(screen.frame, display: true)
+                panel.contentView = NSHostingView(
+                    rootView: HighlightOverlayView(stateMachine: stateMachine, screenBounds: screen.frame)
+                )
+                panel.orderFrontRegardless()
+            }
+        }
+    }
+
+    private func hideHighlightPanels() {
+        highlightPanels.forEach { $0.close() }
+        highlightPanels.removeAll()
     }
 }

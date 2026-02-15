@@ -76,6 +76,50 @@ struct OverlayContentView: View {
     }
 }
 
+// MARK: - Full-Screen Highlight Overlay
+
+struct HighlightOverlayView: View {
+    @ObservedObject var stateMachine: GuidanceStateMachine
+    let screenBounds: CGRect
+
+    var body: some View {
+        ZStack {
+            if case .guiding = stateMachine.phase,
+               let plan = stateMachine.currentPlan,
+               stateMachine.currentStepIndex < plan.steps.count {
+                let step = plan.steps[stateMachine.currentStepIndex]
+                ForEach(Array(step.targets.enumerated()), id: \.offset) { _, target in
+                    HighlightRectOnScreen(target: target, screenBounds: screenBounds)
+                }
+            }
+        }
+        .frame(width: screenBounds.width, height: screenBounds.height)
+        .background(Color.clear)
+        .allowsHitTesting(false)
+    }
+}
+
+struct HighlightRectOnScreen: View {
+    let target: TargetRect
+    let screenBounds: CGRect
+
+    var body: some View {
+        let x = target.x * screenBounds.width
+        let y = target.y * screenBounds.height
+        let w = target.w * screenBounds.width
+        let h = target.h * screenBounds.height
+
+        RoundedRectangle(cornerRadius: 8)
+            .fill(Color.blue.opacity(0.16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.blue.opacity(0.95), lineWidth: 2.5)
+            )
+            .frame(width: w, height: h)
+            .position(x: x + w / 2, y: y + h / 2)
+    }
+}
+
 // MARK: - InstructionBubble
 
 struct InstructionBubble: View {
