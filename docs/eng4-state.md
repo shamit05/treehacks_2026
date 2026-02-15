@@ -70,13 +70,52 @@ When `submitGoal()` is called:
 
 All of this happens in a `Task { @MainActor in ... }` block since published properties must update on the main thread.
 
-### 3. Click Handling Flow
+### 3. Click Handling + Per-Step Re-screenshot Flow (IMPORTANT)
+
+The original plan is only accurate for step 1 (same screenshot). After each step the UI changes (a menu opens, a dialog appears, etc.), so the bounding boxes for later steps would be wrong. **After each step advance, re-capture the screen and call `POST /next` to get fresh targets.**
 
 When `handleClick(at:)` is called (only when `phase == .guiding`):
 1. Get the current step from `currentPlan.steps[currentStepIndex]`
 2. Use Eng 2's `CoordinateMapper` to check if the click is inside any target rect
-3. **Hit:** call `advanceStep()` — increment index, check if done
-4. **Miss:** log a `clickMiss` event, set `hintMessage = "Try clicking the highlighted area"`, clear hint after 2 seconds
+3. **Miss:** log a `clickMiss` event, set `hintMessage = "Try clicking the highlighted area"`, clear hint after 2s
+4. **Hit:** call `advanceStep()` which does the re-screenshot flow:
+
+**`advanceStep()` flow:**
+```
+1. Log clickHit + stepAdvanced events
+2. Build completedSteps list from plan.steps[0...currentStepIndex]
+3. If currentStepIndex + 1 >= original totalSteps → phase = .completed, done
+4. Otherwise:
+   a. phase = .loading  (shows brief loading indicator between steps)
+   b. Capture fresh screenshot via captureService
+   c. Call networkClient.requestNextStep(
+        goal: session.goal,
+        screenshotData: freshScreenshot.imageData,
+        imageSize: ...,
+        completedSteps: [{"id":"s1","instruction":"..."},{"id":"s2","instruction":"..."}],
+        totalSteps: originalPlan.steps.count
+      )
+   d. On success: replace currentPlan.steps with the returned steps,
+      set currentStepIndex = 0 (since returned steps are relative),
+      phase = .guiding
+   e. On failure: phase = .error(message)
+```
+
+**The `POST /next` contract** (Eng 3 owns this endpoint):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `goal` | string | Original goal |
+| `image_size` | JSON string | `{"w":1920,"h":1080}` |
+| `screenshot` | file (PNG) | **Fresh** screenshot of current screen |
+| `completed_steps` | JSON string | Array: `[{"id":"s1","instruction":"Click File"},...]` |
+| `total_steps` | int | Total steps from original plan |
+| `learning_profile` | string (opt) | User learning preference |
+| `app_context` | string (opt) | App context JSON |
+
+Returns: a `StepPlan` with only 1-2 steps (the immediate next action).
+
+**Add `requestNextStep()` to `AgentNetworkClient`** (or ask Eng 3 to add it -- they own Networking/). It's similar to `requestPlan()` but posts to `/next` instead of `/plan` and includes the `completed_steps` + `total_steps` form fields.
 
 ### 4. Session State (`Models/SessionState.swift`)
 
@@ -171,13 +210,19 @@ func debugLoadMockPlan() {
          ▲                       │
          │ reset()               │ submitGoal()
          │                       ▼
-    completed ◄──── guiding ◄── loading
-                       │            │
-                       │            │ error
-                       │            ▼
-                       └────► error(msg)
-                  (3+ misses → replan later)
+         │                     loading ◄─────────┐
+         │                       │               │
+         │                  plan received    advanceStep()
+         │                       │          (re-screenshot + /next)
+         │                       ▼               │
+    completed ◄──── guiding ─────────────────────┘
+         ▲             │
+         │             │ error at any point
+         │             ▼
+         └────── error(msg)
 ```
+
+Key change: **guiding loops back to loading on each step advance** (re-capture + `/next` call), then back to guiding with fresh targets. The loading state between steps should show a brief indicator (spinner or pulse) so the user knows targets are being refreshed.
 
 ---
 

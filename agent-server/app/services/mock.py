@@ -1,7 +1,7 @@
 # app/services/mock.py
-# Owner: Eng 3 (Agent Server)
+# Owner: Eng 3 (Agent Pipeline)
 #
-# Returns a hardcoded valid StepPlan for demo mode.
+# Returns hardcoded valid StepPlans for demo mode.
 # Activated when MOCK_MODE=true environment variable is set.
 
 from app.schemas.step_plan import (
@@ -14,12 +14,46 @@ from app.schemas.step_plan import (
 )
 
 
-def get_mock_plan(goal: str) -> StepPlan:
-    """Return a mock step plan that validates against the schema."""
+def get_mock_next_step(
+    goal: str,
+    image_size: ImageSize | None = None,
+    next_step_number: int = 2,
+) -> StepPlan:
+    """Return a single mock next-step that validates against the schema."""
+    size = image_size or ImageSize(w=1920, h=1080)
+
     return StepPlan(
         version="v1",
         goal=goal,
-        image_size=ImageSize(w=1920, h=1080),
+        image_size=size,
+        steps=[
+            Step(
+                id=f"s{next_step_number}",
+                instruction=f"Click the next button to continue (step {next_step_number}).",
+                targets=[
+                    TargetRect(
+                        x=0.45,
+                        y=0.5,
+                        w=0.1,
+                        h=0.04,
+                        confidence=0.88,
+                        label="Next button",
+                    )
+                ],
+                advance=Advance(type=AdvanceType.click_in_target),
+            ),
+        ],
+    )
+
+
+def get_mock_plan(goal: str, image_size: ImageSize | None = None) -> StepPlan:
+    """Return a mock step plan that validates against the schema."""
+    size = image_size or ImageSize(w=1920, h=1080)
+
+    return StepPlan(
+        version="v1",
+        goal=goal,
+        image_size=size,
         steps=[
             Step(
                 id="s1",

@@ -1,9 +1,9 @@
-# app/routers/plan.py
+# app/routers/replan.py
 # Owner: Eng 3 (Agent Pipeline)
 #
-# POST /plan endpoint.
-# Receives a goal + screenshot, returns a StepPlan JSON.
-# Supports MOCK_MODE for demo reliability.
+# POST /replan endpoint.
+# Called when the user is stuck on a step (e.g., 3+ click misses).
+# Takes a fresh screenshot and produces a revised plan.
 
 import json
 import os
@@ -11,38 +11,38 @@ import os
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from app.schemas.step_plan import ImageSize, StepPlan
-from app.services.agent import AgentError, generate_plan
+from app.services.agent import AgentError, generate_replan
 from app.services.mock import get_mock_plan
 
 router = APIRouter()
 
-MAX_SCREENSHOT_BYTES = 20 * 1024 * 1024  # 20 MB
 
-
-@router.post("/plan", response_model=StepPlan)
-async def create_plan(
+@router.post("/replan", response_model=StepPlan)
+async def create_replan(
     request: Request,
     goal: str = Form(...),
     image_size: str = Form(...),
     screenshot: UploadFile = File(...),
+    current_step_id: str = Form(...),
     learning_profile: str = Form(None),
     app_context: str = Form(None),
     session_summary: str = Form(None),
 ):
     """
-    Generate a step-by-step guidance plan from a goal and screenshot.
+    Generate a revised step plan when the user is stuck on a step.
 
-    - **goal**: Natural language task description
+    - **goal**: Original task description
     - **image_size**: JSON string like {"w": 1920, "h": 1080}
-    - **screenshot**: PNG image of the current screen
+    - **screenshot**: Fresh PNG screenshot of the current screen state
+    - **current_step_id**: The step ID where the user got stuck (e.g., "s3")
     - **learning_profile**: Optional learning style preference
     - **app_context**: Optional JSON string with app_name, bundle_id, window_title
-    - **session_summary**: Optional short summary of recent session events
+    - **session_summary**: Optional summary of recent session events
     """
     request_id = getattr(request.state, "request_id", "unknown")
-    print(f"[plan] rid={request_id} goal={goal!r}")
+    print(f"[replan] rid={request_id} goal={goal!r} stuck_at={current_step_id}")
 
-    # --- Parse and validate image_size ---
+    # --- Parse image_size ---
     try:
         size_dict = json.loads(image_size)
         parsed_size = ImageSize.model_validate(size_dict)
@@ -52,35 +52,32 @@ async def create_plan(
     # --- Mock mode ---
     mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
     if mock_mode:
-        print(f"[plan] rid={request_id} returning mock plan")
+        print(f"[replan] rid={request_id} returning mock plan")
         return get_mock_plan(goal, parsed_size)
 
-    # --- Read and validate screenshot ---
+    # --- Read screenshot ---
     screenshot_bytes = await screenshot.read()
     if len(screenshot_bytes) == 0:
         raise HTTPException(status_code=422, detail="Screenshot file is empty")
-    if len(screenshot_bytes) > MAX_SCREENSHOT_BYTES:
-        raise HTTPException(status_code=413, detail="Screenshot exceeds 20 MB limit")
 
-    print(f"[plan] rid={request_id} screenshot={len(screenshot_bytes)} bytes, size={parsed_size.w}x{parsed_size.h}")
-
-    # --- Generate plan via AI ---
+    # --- Generate revised plan ---
     try:
-        plan = await generate_plan(
+        plan = await generate_replan(
             goal=goal,
             image_size=parsed_size,
             screenshot_bytes=screenshot_bytes,
+            current_step_id=current_step_id,
             learning_profile=learning_profile,
             app_context=app_context,
             session_summary=session_summary,
             request_id=request_id,
         )
     except AgentError as e:
-        print(f"[plan] rid={request_id} agent error: {e}")
+        print(f"[replan] rid={request_id} agent error: {e}")
         raise HTTPException(status_code=502, detail=f"Agent failed: {e}")
     except Exception as e:
-        print(f"[plan] rid={request_id} unexpected error: {type(e).__name__}: {e}")
+        print(f"[replan] rid={request_id} unexpected error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
-    print(f"[plan] rid={request_id} success, {len(plan.steps)} steps")
+    print(f"[replan] rid={request_id} success, {len(plan.steps)} steps")
     return plan
