@@ -137,7 +137,7 @@ private final class HighlightOverlayNSView: NSView {
         let strokeColor = NSColor.systemBlue.withAlphaComponent(0.95)
 
         for target in targets {
-            let screenRect = mapper.normalizedToScreen(target)
+            guard let screenRect = mapper.normalizedToScreen(target) else { continue }
             let localRect = screenRect.offsetBy(dx: -screenBounds.origin.x, dy: -screenBounds.origin.y)
             let path = NSBezierPath(roundedRect: localRect, xRadius: 8, yRadius: 8)
 

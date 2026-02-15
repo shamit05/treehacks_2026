@@ -10,6 +10,7 @@ from app.schemas.step_plan import (
     ImageSize,
     Step,
     StepPlan,
+    TargetType,
     TargetRect,
 )
 
@@ -32,6 +33,7 @@ def get_mock_next_step(
                 instruction=f"Click the next button to continue (step {next_step_number}).",
                 targets=[
                     TargetRect(
+                        type=TargetType.bbox_norm,
                         x=0.45,
                         y=0.5,
                         w=0.1,
@@ -60,6 +62,7 @@ def get_mock_plan(goal: str, image_size: ImageSize | None = None) -> StepPlan:
                 instruction="Click the menu bar item to begin.",
                 targets=[
                     TargetRect(
+                        type=TargetType.bbox_norm,
                         x=0.02,
                         y=0.0,
                         w=0.06,
@@ -75,6 +78,7 @@ def get_mock_plan(goal: str, image_size: ImageSize | None = None) -> StepPlan:
                 instruction="Select 'New...' from the dropdown menu.",
                 targets=[
                     TargetRect(
+                        type=TargetType.bbox_norm,
                         x=0.02,
                         y=0.04,
                         w=0.12,
@@ -90,6 +94,7 @@ def get_mock_plan(goal: str, image_size: ImageSize | None = None) -> StepPlan:
                 instruction="Type your information in the text field.",
                 targets=[
                     TargetRect(
+                        type=TargetType.bbox_norm,
                         x=0.25,
                         y=0.3,
                         w=0.5,
@@ -105,6 +110,7 @@ def get_mock_plan(goal: str, image_size: ImageSize | None = None) -> StepPlan:
                 instruction="Click 'Save' to confirm.",
                 targets=[
                     TargetRect(
+                        type=TargetType.bbox_norm,
                         x=0.7,
                         y=0.85,
                         w=0.1,

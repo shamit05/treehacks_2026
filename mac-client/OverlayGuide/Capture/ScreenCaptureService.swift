@@ -11,6 +11,8 @@ import Foundation
 struct ScreenshotResult {
     let image: NSImage
     let imageData: Data        // PNG data for sending to the agent
+    let pixelWidth: Int
+    let pixelHeight: Int
     let displayID: CGDirectDisplayID
     let screenBounds: CGRect
     let scaleFactor: CGFloat
@@ -56,7 +58,9 @@ class ScreenCaptureService {
 
         let scaleFactor = self.scaleFactor(for: displayId)
 
-        let nsImage = NSImage(cgImage: cgImage, size: displayBounds.size)
+        let pixelWidth = cgImage.width
+        let pixelHeight = cgImage.height
+        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: pixelWidth, height: pixelHeight))
 
         guard let tiffData = nsImage.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
@@ -67,6 +71,8 @@ class ScreenCaptureService {
         return ScreenshotResult(
             image: nsImage,
             imageData: pngData,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
             displayID: displayId,
             screenBounds: displayBounds,
             scaleFactor: scaleFactor,

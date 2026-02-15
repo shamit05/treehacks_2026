@@ -17,10 +17,11 @@ Re-analyze the screenshot and produce an UPDATED plan that:
 HARD RULES:
 1) Output ONLY valid JSON. No explanations, no markdown, no extra text.
 2) The JSON MUST conform to the StepPlan schema — same as the /plan endpoint.
-3) All coordinates are NORMALIZED [0, 1], origin = TOP-LEFT (0,0).
-4) Target rectangles must be TIGHT around the clickable element.
-5) If the UI has changed significantly and you cannot identify the right targets, produce 1-2 steps with manual_next advance type.
-6) Step IDs should continue from the stuck step (e.g., if stuck on s3, new steps start at s3, s4, s5...).
+3) Output bbox targets with "type":"bbox_norm".
+4) All coordinates are NORMALIZED [0, 1], origin = TOP-LEFT (0,0).
+5) Target rectangles must be TIGHT around the clickable element.
+6) If the UI has changed significantly and you cannot identify the right targets, produce 1-2 steps with manual_next advance type.
+7) Step IDs should continue from the stuck step (e.g., if stuck on s3, new steps start at s3, s4, s5...).
 
 LEARNING PROFILE:
 The user's learning preference is: {{LEARNING_PROFILE_TEXT}}

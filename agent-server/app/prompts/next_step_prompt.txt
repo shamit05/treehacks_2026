@@ -13,12 +13,13 @@ Look at the CURRENT screenshot and identify the NEXT 1-2 actions the user needs 
 HARD RULES:
 1) Output ONLY valid JSON. No explanations, no markdown, no extra text.
 2) The JSON MUST conform to the StepPlan schema.
-3) All coordinates are NORMALIZED [0, 1], origin = TOP-LEFT (0,0).
-4) Target rectangles must be TIGHT around the clickable/interactable element.
-5) Return only 1-2 steps. The FIRST step is the immediate next action. The SECOND step (optional) is what comes after, IF you can see it on the current screen.
-6) Step IDs should continue the sequence (e.g., if 2 steps are done, next is "s3").
-7) If the screen looks different than expected (e.g., a dialog appeared, an error showed up), adapt — describe what you see and what to do.
-8) If you cannot confidently identify the next target, return 1 step with advance.type = "manual_next".
+3) Output bbox targets with "type":"bbox_norm".
+4) All coordinates are NORMALIZED [0, 1], origin = TOP-LEFT (0,0).
+5) Target rectangles must be TIGHT around the clickable/interactable element.
+6) Return only 1-2 steps. The FIRST step is the immediate next action. The SECOND step (optional) is what comes after, IF you can see it on the current screen.
+7) Step IDs should continue the sequence (e.g., if 2 steps are done, next is "s3").
+8) If the screen looks different than expected (e.g., a dialog appeared, an error showed up), adapt — describe what you see and what to do.
+9) If you cannot confidently identify the next target, return 1 step with advance.type = "manual_next".
 
 ADVANCE TYPES:
 - "click_in_target": User clicks inside the target. Use for buttons, menu items, links.
@@ -35,7 +36,7 @@ SCHEMA:
     {
       "id": "sN",
       "instruction": "<what to do next>",
-      "targets": [{"x": <float>, "y": <float>, "w": <float>, "h": <float>, "confidence": <float>, "label": "<element name>"}],
+      "targets": [{"type":"bbox_norm", "x": <float>, "y": <float>, "w": <float>, "h": <float>, "confidence": <float>, "label": "<element name>"}],
       "advance": {"type": "<advance_type>"}
     }
   ]

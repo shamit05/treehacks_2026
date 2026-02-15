@@ -18,19 +18,28 @@ struct CoordinateMapper {
     let scaleFactor: CGFloat
 
     /// Convert a normalized target rect (top-left origin) to screen coordinates (bottom-left origin).
-    func normalizedToScreen(_ target: TargetRect) -> CGRect {
-        let x = target.x * screenBounds.width + screenBounds.origin.x
-        let w = target.w * screenBounds.width
-        let h = target.h * screenBounds.height
+    func normalizedToScreen(_ target: TargetRect) -> CGRect? {
+        guard target.type == .bboxNorm,
+              let tx = target.x,
+              let ty = target.y,
+              let tw = target.w,
+              let th = target.h else {
+            return nil
+        }
+        let x = tx * screenBounds.width + screenBounds.origin.x
+        let w = tw * screenBounds.width
+        let h = th * screenBounds.height
         // Flip Y: macOS bottom-left origin
-        let y = screenBounds.height - (target.y * screenBounds.height + h) + screenBounds.origin.y
+        let y = screenBounds.height - (ty * screenBounds.height + h) + screenBounds.origin.y
 
         return CGRect(x: x, y: y, width: w, height: h)
     }
 
     /// Check if a screen-space click point (bottom-left origin) falls inside a normalized target rect.
     func isClick(_ clickPoint: CGPoint, insideTarget target: TargetRect) -> Bool {
-        let screenRect = normalizedToScreen(target)
+        guard let screenRect = normalizedToScreen(target) else {
+            return false
+        }
         return screenRect.contains(clickPoint)
     }
 

@@ -57,18 +57,35 @@ struct Step: Codable, Equatable, Identifiable {
 // MARK: - TargetRect
 
 struct TargetRect: Codable, Equatable {
-    /// Normalized x (0..1), top-left origin
-    let x: Double
-    /// Normalized y (0..1), top-left origin
-    let y: Double
-    /// Normalized width (0..1)
-    let w: Double
-    /// Normalized height (0..1)
-    let h: Double
+    let type: TargetType
+    /// Marker id when type == som_marker
+    let markerId: Int?
+    /// Normalized x (0..1), top-left origin, when type == bbox_norm
+    let x: Double?
+    /// Normalized y (0..1), top-left origin, when type == bbox_norm
+    let y: Double?
+    /// Normalized width (0..1), when type == bbox_norm
+    let w: Double?
+    /// Normalized height (0..1), when type == bbox_norm
+    let h: Double?
     /// Model confidence (0..1), optional
     let confidence: Double?
     /// Human-readable label for the target
     let label: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, x, y, w, h, confidence, label
+        case markerId = "marker_id"
+    }
+
+    var hasBBox: Bool {
+        type == .bboxNorm && x != nil && y != nil && w != nil && h != nil
+    }
+}
+
+enum TargetType: String, Codable, Equatable {
+    case somMarker = "som_marker"
+    case bboxNorm = "bbox_norm"
 }
 
 // MARK: - Advance

@@ -61,6 +61,8 @@ struct OverlayUITestConfig {
                 instruction: "Test step \(startIndex + idx): interact with highlighted area.",
                 targets: [
                     TargetRect(
+                        type: .bboxNorm,
+                        markerId: nil,
                         x: x,
                         y: shiftedY,
                         w: w,

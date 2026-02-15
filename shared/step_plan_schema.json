@@ -85,13 +85,18 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": [
-                "x",
-                "y",
-                "w",
-                "h"
-              ],
               "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "som_marker",
+                    "bbox_norm"
+                  ]
+                },
+                "marker_id": {
+                  "type": "integer",
+                  "minimum": 0
+                },
                 "x": {
                   "type": "number",
                   "minimum": 0.0,
@@ -120,7 +125,35 @@
                 "label": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "type"
+              ],
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "som_marker"
+                    }
+                  },
+                  "required": [
+                    "marker_id"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "bbox_norm"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "w",
+                    "h"
+                  ]
+                }
+              ]
             }
           },
           "advance": {

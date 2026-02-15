@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 load_dotenv()  # load .env before anything else
 
-from app.routers import next_step, plan, replan  # noqa: E402
+from app.routers import next_step, plan, refine, replan  # noqa: E402
 
 
 @asynccontextmanager
@@ -88,8 +88,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # Register routers
 app.include_router(plan.router)
+app.include_router(refine.router)
 app.include_router(next_step.router)
 app.include_router(replan.router)
+app.include_router(refine.router)
 
 
 @app.get("/health")
