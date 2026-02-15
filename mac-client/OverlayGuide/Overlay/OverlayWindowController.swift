@@ -37,9 +37,19 @@ class OverlayWindowController {
         }
         guard let window else { return }
 
+        // Reposition near cursor on every show request.
+        let mouse = NSEvent.mouseLocation
+        if let screen = screenContaining(point: mouse) {
+            let origin = popupOrigin(near: mouse, in: screen.visibleFrame)
+            window.setFrameOrigin(origin)
+        }
+
         let hostingView = NSHostingView(
             rootView: OverlayContentView(stateMachine: stateMachine)
         )
+        hostingView.wantsLayer = true
+        hostingView.layer?.cornerRadius = 20
+        hostingView.layer?.masksToBounds = true
         window.contentView = hostingView
         applyInteraction(for: phase, window: window)
     }
@@ -56,24 +66,16 @@ class OverlayWindowController {
     private func createWindow() -> NSWindow {
         let visibleFrame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
             ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let origin = CGPoint(
-            x: visibleFrame.maxX - popupSize.width - 24,
-            y: visibleFrame.maxY - popupSize.height - 24
-        )
+        let mouse = NSEvent.mouseLocation
+        let origin = popupOrigin(near: mouse, in: visibleFrame)
 
         let window = OverlayPopupWindow(
             contentRect: CGRect(origin: origin, size: popupSize),
-            styleMask: [.titled, .fullSizeContentView],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
-        window.title = "OverlayGuide"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
-        window.standardWindowButton(.closeButton)?.isHidden = true
-        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        window.standardWindowButton(.zoomButton)?.isHidden = true
         window.isOpaque = false
         window.backgroundColor = .clear
         window.level = .floating
@@ -84,6 +86,25 @@ class OverlayWindowController {
         window.hidesOnDeactivate = false
         window.isReleasedWhenClosed = false
         return window
+    }
+
+    private func screenContaining(point: CGPoint) -> NSScreen? {
+        NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main ?? NSScreen.screens.first
+    }
+
+    private func popupOrigin(near cursor: CGPoint, in visibleFrame: CGRect) -> CGPoint {
+        let margin: CGFloat = 12
+        let defaultX = cursor.x + 20
+        let defaultY = cursor.y - (popupSize.height * 0.5)
+
+        let minX = visibleFrame.minX + margin
+        let maxX = visibleFrame.maxX - popupSize.width - margin
+        let minY = visibleFrame.minY + margin
+        let maxY = visibleFrame.maxY - popupSize.height - margin
+
+        let clampedX = min(max(defaultX, minX), maxX)
+        let clampedY = min(max(defaultY, minY), maxY)
+        return CGPoint(x: clampedX, y: clampedY)
     }
 
     private func applyInteraction(for phase: GuidancePhase, window: NSWindow) {

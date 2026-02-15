@@ -14,11 +14,10 @@ struct GoalInputView: View {
     @State private var dragStartOffset: CGSize = .zero
 
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             Capsule()
                 .fill(Color.secondary.opacity(0.5))
                 .frame(width: 36, height: 5)
-                .padding(.top, 4)
                 .gesture(
                     DragGesture()
                         .onChanged { value in
@@ -38,7 +37,7 @@ struct GoalInputView: View {
                 .foregroundColor(.primary)
 
             HStack {
-                TextField("e.g. Create a new calendar event for tomorrow at 3pm", text: $goalText)
+                TextField("e.g. Explain to me how to use the crop feature", text: $goalText)
                     .textFieldStyle(.plain)
                     .font(.body)
                     .foregroundColor(.primary)
@@ -62,8 +61,10 @@ struct GoalInputView: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(24)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 18)
+        .padding(.bottom, 18)
+        .padding(.top, 10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20))
         .frame(maxWidth: 500)
         .offset(dragOffset)
         .onAppear {
