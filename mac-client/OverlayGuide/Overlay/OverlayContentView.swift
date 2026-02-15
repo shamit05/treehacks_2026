@@ -2,107 +2,389 @@
 // Owner: Eng 1 (Overlay UI)
 //
 // SwiftUI content rendered inside the popup overlay window.
-// All states (loading, guiding, error, completed) render in
-// the same compact bubble — no separate popup windows.
+// UNIFIED SINGLE-PANEL DESIGN: one persistent container that smoothly
+// transitions between input, loading, guiding, and completed states.
+// No separate popups or windows — everything renders in the same bubble.
 
 import AppKit
 import SwiftUI
 
+// MARK: - Main Content View (unified panel)
+
 struct OverlayContentView: View {
     @ObservedObject var stateMachine: GuidanceStateMachine
+    @State private var goalText: String = ""
+    @StateObject private var voiceInput = AppleVoiceInputService()
+    @FocusState private var isFocused: Bool
+    @State private var voiceError: String?
+
+    private var isCompleted: Bool {
+        if case .completed = stateMachine.phase { return true }
+        return false
+    }
 
     var body: some View {
-        Group {
-            switch stateMachine.phase {
-            case .idle:
-                EmptyView()
-            case .inputGoal:
-                GoalInputView(stateMachine: stateMachine)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .loading:
-                // Compact inline pill — same visual style as the instruction bubble
-                StatusBubble(
-                    icon: "circle.dotted",
-                    iconColor: .blue,
-                    title: stateMachine.loadingStatus,
-                    subtitle: nil,
-                    showSpinner: true
-                )
-            case .guiding:
-                if let plan = stateMachine.currentPlan {
-                    PlanView(plan: plan, completedCount: stateMachine.completedSteps.count, hintMessage: stateMachine.hintMessage, onDismiss: { stateMachine.reset() })
-                } else {
-                    StatusBubble(
-                        icon: "ellipsis.circle",
-                        iconColor: .secondary,
-                        title: "Preparing next step...",
-                        subtitle: nil,
-                        showSpinner: true
-                    )
-                }
-            case .completed:
-                CompletionView(stateMachine: stateMachine)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .error(let message):
-                StatusBubble(
-                    icon: "exclamationmark.triangle.fill",
-                    iconColor: .orange,
-                    title: "Something went wrong",
-                    subtitle: message,
-                    showSpinner: false
-                )
+        VStack(spacing: 0) {
+            // ── Header: input field or submitted goal ──
+            headerSection
+
+            // ── Content: only shown after submission ──
+            if stateMachine.phase != .inputGoal && stateMachine.phase != .idle {
+                Divider()
+                    .overlay(Color.secondary.opacity(0.25))
+
+                contentSection
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.clear)
-    }
-}
-
-// MARK: - StatusBubble (reusable for loading, error, waiting states)
-
-/// A compact status bubble that matches the InstructionBubble style.
-/// Used for loading, errors, and waiting states so everything appears
-/// in the same consistent bubble — no separate popup windows.
-private struct StatusBubble: View {
-    let icon: String
-    let iconColor: Color
-    let title: String
-    let subtitle: String?
-    let showSpinner: Bool
-
-    var body: some View {
-        HStack(spacing: 10) {
-            if showSpinner {
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .scaleEffect(0.7)
-                    .tint(.blue)
+        .animation(.easeInOut(duration: 0.25), value: stateMachine.phase)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+        )
+        .overlay(
+            // Green tint overlay for completed state — drawn on top of opaque bg
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(isCompleted ? Color.green.opacity(0.12) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isCompleted
+                    ? Color.green.opacity(0.4)
+                    : Color.secondary.opacity(0.25), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .shadow(color: .black.opacity(0.15), radius: 12, y: 4)
+        .padding(8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onExitCommand {
+            stateMachine.reset()
+        }
+        .onChange(of: stateMachine.phase) { newPhase in
+            if newPhase == .inputGoal {
+                goalText = ""
+                voiceError = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    isFocused = true
+                }
             } else {
-                Image(systemName: icon)
-                    .foregroundColor(iconColor)
-                    .font(.body)
+                // Stop voice input when leaving inputGoal phase
+                voiceInput.stopListening()
+            }
+        }
+        .onReceive(voiceInput.$transcript) { newTranscript in
+            guard case .inputGoal = stateMachine.phase else { return }
+            guard !newTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            goalText = newTranscript
+        }
+    }
+
+    // MARK: - Header
+
+    @ViewBuilder
+    private var headerSection: some View {
+        switch stateMachine.phase {
+        case .idle:
+            EmptyView()
+
+        case .inputGoal:
+            // Editable text field with voice input
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(
+                            LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+
+                    TextField("Help me with ...", text: $goalText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundColor(.primary)
+                        .focused($isFocused)
+                        .onSubmit { submitGoal() }
+
+                    Button(action: toggleVoiceInput) {
+                        Image(systemName: voiceInput.isListening ? "mic.fill" : "mic")
+                            .font(.system(size: 14, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(voiceInput.isListening ? .red : .secondary)
+                    .help(voiceInput.isListening ? "Stop voice input" : "Start voice input")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+
+                if let voiceError {
+                    Text(voiceError)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.red)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 6)
+                }
+            }
+            .onAppear {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    isFocused = true
+                }
             }
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.callout)
+        default:
+            // Show submitted goal as header with dismiss button
+            HStack(spacing: 10) {
+                if case .completed = stateMachine.phase {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.green)
+                } else {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(
+                            LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+                }
+
+                Text(stateMachine.submittedGoal ?? "")
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundColor(.primary)
-                    .animation(.easeInOut(duration: 0.3), value: title)
-                if let subtitle {
-                    Text(subtitle)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer()
+
+                Button(action: { stateMachine.reset() }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundColor(.secondary.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+    }
+
+    // MARK: - Content (below header)
+
+    @ViewBuilder
+    private var contentSection: some View {
+        switch stateMachine.phase {
+
+        case .loading:
+            loadingContent
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+        case .guiding:
+            guidingContent
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+        case .completed:
+            completedContent
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+        case .error(let message):
+            errorContent(message: message)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+        default:
+            EmptyView()
+        }
+    }
+
+    // MARK: - Loading State
+
+    private var loadingContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .scaleEffect(0.65)
+                    .tint(.blue)
+
+                Text(stateMachine.loadingStatus)
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .animation(.easeInOut(duration: 0.2), value: stateMachine.loadingStatus)
+            }
+
+            // Show streaming instruction prominently when it arrives
+            if let instruction = stateMachine.streamingInstruction {
+                Text(instruction)
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundColor(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .animation(.easeInOut(duration: 0.3), value: stateMachine.streamingInstruction)
+            }
+        }
+    }
+
+    // MARK: - Guiding State (step list)
+
+    private var guidingContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let plan = stateMachine.currentPlan {
+                ForEach(Array(plan.steps.enumerated()), id: \.offset) { index, step in
+                    HStack(alignment: .top, spacing: 8) {
+                        let stepNum = stateMachine.completedSteps.count + index + 1
+                        let isActive = index == 0
+
+                        ZStack {
+                            Circle()
+                                .fill(isActive ? Color.blue : Color.gray.opacity(0.25))
+                                .frame(width: 22, height: 22)
+                            Text("\(stepNum)")
+                                .font(.caption2.bold())
+                                .foregroundColor(isActive ? .white : .secondary)
+                        }
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(step.instruction)
+                                .font(.system(size: 13, weight: isActive ? .medium : .regular))
+                                .foregroundColor(isActive ? .primary : .secondary)
+                            if let label = step.targets.first?.label, !label.isEmpty {
+                                Text(label)
+                                    .font(.caption)
+                                    .foregroundColor(.blue.opacity(0.8))
+                            }
+                        }
+                    }
+                }
+
+                if let hint = stateMachine.hintMessage {
+                    Text(hint)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .padding(.top, 2)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(0.6)
+                        .tint(.blue)
+                    Text("Preparing next step...")
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    // MARK: - Completed State
+
+    private var completedContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundColor(.green)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(stateMachine.completionMessage ?? "All done!")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.primary)
+
+                    Text("\(stateMachine.completedSteps.count) steps completed")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("New Task") {
+                    stateMachine.showInputOverlay()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button("Dismiss") {
+                    stateMachine.reset()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+                .controlSize(.small)
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    // MARK: - Error State
+
+    private func errorContent(message: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.body)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Something went wrong")
+                        .font(.callout)
+                        .foregroundColor(.primary)
+                    Text(message)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(2)
                 }
             }
+
+            HStack(spacing: 10) {
+                Button("Retry") {
+                    // Re-submit the same goal
+                    if let goal = stateMachine.submittedGoal {
+                        stateMachine.showInputOverlay()
+                        goalText = goal
+                        // Auto-submit after brief delay for overlay to appear
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            stateMachine.submitGoal(goal)
+                        }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button("Dismiss") {
+                    stateMachine.reset()
+                }
+                .buttonStyle(.plain)
+                .controlSize(.small)
+                .foregroundColor(.secondary)
+            }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.1), radius: 8, y: 2)
-        .frame(maxWidth: 340)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(12)
+    }
+
+    // MARK: - Actions
+
+    private func submitGoal() {
+        let trimmed = goalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        voiceInput.stopListening()
+        stateMachine.submitGoal(trimmed)
+    }
+
+    private func toggleVoiceInput() {
+        voiceError = nil
+        if voiceInput.isListening {
+            voiceInput.stopListening()
+            return
+        }
+        Task { @MainActor in
+            let granted = await voiceInput.requestPermissions()
+            guard granted else {
+                voiceError = "Enable microphone + speech permissions in System Settings."
+                return
+            }
+            do {
+                try voiceInput.startListening()
+            } catch {
+                voiceError = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -250,144 +532,5 @@ private final class HighlightOverlayNSView: NSView {
 
         let textPoint = CGPoint(x: badgeRect.minX + badgePadH, y: badgeRect.minY + badgePadV)
         (label as NSString).draw(at: textPoint, withAttributes: attrs)
-    }
-}
-
-// MARK: - InstructionBubble
-
-struct InstructionBubble: View {
-    let instruction: String
-    let stepNumber: Int
-    let totalSteps: Int
-    let hintMessage: String?
-    @State private var dragOffset: CGSize = .zero
-    @State private var dragStartOffset: CGSize = .zero
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Step \(stepNumber) of \(totalSteps)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-            }
-
-            Text(instruction)
-                .font(.callout)
-                .foregroundColor(.primary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if let hintMessage {
-                Text(hintMessage)
-                    .font(.caption)
-                    .foregroundColor(.orange)
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: 340)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.15), radius: 10, y: 3)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(12)
-        .offset(dragOffset)
-        .gesture(
-            DragGesture()
-                .onChanged { value in
-                    dragOffset = CGSize(
-                        width: dragStartOffset.width + value.translation.width,
-                        height: dragStartOffset.height + value.translation.height
-                    )
-                }
-                .onEnded { _ in
-                    dragStartOffset = dragOffset
-                }
-        )
-    }
-}
-
-// MARK: - PlanView (shows all steps as a text list)
-
-struct PlanView: View {
-    let plan: StepPlan
-    let completedCount: Int
-    let hintMessage: String?
-    let onDismiss: () -> Void
-    @State private var dragOffset: CGSize = .zero
-    @State private var dragStartOffset: CGSize = .zero
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Header
-            HStack {
-                Image(systemName: "list.bullet.rectangle")
-                    .foregroundColor(.blue)
-                Text(plan.goal)
-                    .font(.headline)
-                    .foregroundColor(.primary)
-                    .lineLimit(2)
-                Spacer()
-                Button(action: onDismiss) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-
-            Divider()
-
-            // Steps
-            ForEach(Array(plan.steps.enumerated()), id: \.offset) { index, step in
-                HStack(alignment: .top, spacing: 10) {
-                    // Step number circle
-                    let stepNum = completedCount + index + 1
-                    let isFirst = index == 0
-                    ZStack {
-                        Circle()
-                            .fill(isFirst ? Color.blue : Color.gray.opacity(0.3))
-                            .frame(width: 24, height: 24)
-                        Text("\(stepNum)")
-                            .font(.caption2.bold())
-                            .foregroundColor(isFirst ? .white : .secondary)
-                    }
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(step.instruction)
-                            .font(.callout)
-                            .foregroundColor(isFirst ? .primary : .secondary)
-                        if let label = step.targets.first?.label, !label.isEmpty {
-                            Text(label)
-                                .font(.caption)
-                                .foregroundColor(.blue)
-                        }
-                    }
-                }
-            }
-
-            if let hint = hintMessage {
-                Text(hint)
-                    .font(.caption)
-                    .foregroundColor(.orange)
-                    .padding(.top, 4)
-            }
-        }
-        .padding(16)
-        .frame(maxWidth: 400)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
-        .shadow(color: .black.opacity(0.15), radius: 12, y: 4)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(12)
-        .offset(dragOffset)
-        .gesture(
-            DragGesture()
-                .onChanged { value in
-                    dragOffset = CGSize(
-                        width: dragStartOffset.width + value.translation.width,
-                        height: dragStartOffset.height + value.translation.height
-                    )
-                }
-                .onEnded { _ in
-                    dragStartOffset = dragOffset
-                }
-        )
     }
 }

@@ -22,6 +22,7 @@ from app.schemas.step_plan import (
 from app.services.agent import AgentError, generate_gemini_next
 from app.services.mock import get_mock_next_step
 from app.services.omniparser import detect_elements, draw_numbered_boxes, format_elements_context, snap_to_nearest_element
+from app.routers.plan import _resolve_bbox, _ADVANCE_MAP
 
 router = APIRouter()
 
@@ -118,18 +119,9 @@ async def next_step(
         status = result.get("status", "done")
         message = result.get("message")
 
-        # --- Convert steps if status is "continue" ---
+        # --- Convert steps if status is "continue" (with YOLO snapping) ---
         converted_steps: list[Step] = []
         if status == "continue":
-            elem_map = {e.id: e for e in elements}
-
-            advance_map = {
-                "click_in_target": AdvanceType.click_in_target,
-                "text_entered_or_next": AdvanceType.text_entered_or_next,
-                "manual_next": AdvanceType.manual_next,
-                "wait_for_ui_change": AdvanceType.wait_for_ui_change,
-            }
-
             for step_data in result.get("steps", []):
                 step_id = step_data.get("id", f"s{len(converted_steps) + 1}")
                 instruction = step_data.get("instruction", "")
@@ -137,36 +129,7 @@ async def next_step(
                 confidence = step_data.get("confidence", 0.5)
                 advance_type = step_data.get("advance", "click_in_target")
 
-                box_2d = step_data.get("box_2d")
-                element_id = step_data.get("element_id")
-
-                rx, ry, rw, rh = None, None, None, None
-
-                if box_2d and len(box_2d) == 4:
-                    ymin, xmin, ymax, xmax = box_2d
-                    rx = xmin / 1000.0
-                    ry = ymin / 1000.0
-                    rw = (xmax - xmin) / 1000.0
-                    rh = (ymax - ymin) / 1000.0
-                    print(f"[next] rid={request_id} step={step_id} Gemini box_2d={box_2d} -> ({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
-
-                    # Snap to nearest YOLO element for pixel-precise bbox
-                    sx, sy, sw, sh, snap_id = snap_to_nearest_element(rx, ry, rw, rh, elements)
-                    if snap_id is not None:
-                        print(f"[next] rid={request_id} step={step_id} SNAPPED to YOLO elem[{snap_id}]=({sx:.3f},{sy:.3f},{sw:.3f},{sh:.3f})")
-                        rx, ry, rw, rh = sx, sy, sw, sh
-
-                if rx is None and element_id is not None and element_id in elem_map:
-                    elem = elem_map[element_id]
-                    rx, ry, rw, rh = elem.bbox_xywh
-
-                if rx is None:
-                    rx, ry, rw, rh = 0.4, 0.4, 0.2, 0.2
-
-                rx = max(0.0, min(rx, 1.0))
-                ry = max(0.0, min(ry, 1.0))
-                rw = max(0.02, min(rw, 1.0 - rx))
-                rh = max(0.02, min(rh, 1.0 - ry))
+                rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "next")
 
                 converted_steps.append(Step(
                     id=step_id,
@@ -177,7 +140,7 @@ async def next_step(
                         confidence=confidence,
                         label=label,
                     )],
-                    advance=Advance(type=advance_map.get(advance_type, AdvanceType.click_in_target)),
+                    advance=Advance(type=_ADVANCE_MAP.get(advance_type, AdvanceType.click_in_target)),
                 ))
 
         response = NextStepResponse(

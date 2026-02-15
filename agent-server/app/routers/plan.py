@@ -10,6 +10,8 @@
 import io
 import json
 import os
+import time
+from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
@@ -26,7 +28,7 @@ from app.schemas.step_plan import (
     TargetRect,
     TargetType,
 )
-from app.services.agent import AgentError
+from app.services.agent import AgentError, is_native_genai_available, upload_images_to_gemini
 from app.services.mock import get_mock_plan
 from app.services.omniparser import (
     OmniElement,
@@ -41,6 +43,97 @@ from app.services.omniparser import (
 router = APIRouter()
 
 MAX_SCREENSHOT_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+# ---------------------------------------------------------------------------
+# Shared: convert Gemini step_data → (rx, ry, rw, rh) with YOLO snapping
+# ---------------------------------------------------------------------------
+
+from app.schemas.step_plan import Advance, AdvanceType
+
+_ADVANCE_MAP = {
+    "click_in_target": AdvanceType.click_in_target,
+    "text_entered_or_next": AdvanceType.text_entered_or_next,
+    "manual_next": AdvanceType.manual_next,
+    "wait_for_ui_change": AdvanceType.wait_for_ui_change,
+}
+
+
+def _resolve_bbox(
+    step_data: dict,
+    elements: list,
+    request_id: str = "",
+    endpoint: str = "plan",
+) -> tuple[float, float, float, float]:
+    """
+    Resolve a bounding box from Gemini's response, using YOLO snapping for accuracy.
+
+    Priority order:
+      1. box_2d → convert from 0-1000, snap to nearest YOLO element
+      2. element_id → use YOLO element's precise bbox
+      3. Fallback: center of screen
+
+    Returns (x, y, w, h) in normalized [0,1] coords.
+    """
+    elem_map = {e.id: e for e in elements}
+    step_id = step_data.get("id", "?")
+    box_2d = step_data.get("box_2d")
+    element_id = step_data.get("element_id")
+
+    rx, ry, rw, rh = None, None, None, None
+
+    # --- Priority 1: box_2d → snap to nearest YOLO element ---
+    if box_2d and len(box_2d) == 4:
+        ymin, xmin, ymax, xmax = box_2d
+        raw_x = xmin / 1000.0
+        raw_y = ymin / 1000.0
+        raw_w = (xmax - xmin) / 1000.0
+        raw_h = (ymax - ymin) / 1000.0
+        print(f"[{endpoint}] rid={request_id} step={step_id} Gemini box_2d={box_2d} -> raw=({raw_x:.3f},{raw_y:.3f},{raw_w:.3f},{raw_h:.3f})")
+
+        # Snap to nearest YOLO element for precision
+        rx, ry, rw, rh, matched_id = snap_to_nearest_element(
+            raw_x, raw_y, raw_w, raw_h, elements
+        )
+        if matched_id is not None:
+            print(f"[{endpoint}] rid={request_id} step={step_id} SNAPPED to elem[{matched_id}]=({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
+        else:
+            print(f"[{endpoint}] rid={request_id} step={step_id} no snap match, using raw Gemini coords")
+
+    # --- Priority 2: element_id from YOLO ---
+    if rx is None and element_id is not None and element_id in elem_map:
+        elem = elem_map[element_id]
+        rx, ry, rw, rh = elem.bbox_xywh
+        print(f"[{endpoint}] rid={request_id} step={step_id} YOLO elem[{element_id}]=({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
+
+    # --- Priority 3: fallback ---
+    if rx is None:
+        rx, ry, rw, rh = 0.4, 0.4, 0.2, 0.2
+        print(f"[{endpoint}] rid={request_id} step={step_id} FALLBACK center-of-screen")
+
+    # Clamp
+    rx = max(0.0, min(rx, 1.0))
+    ry = max(0.0, min(ry, 1.0))
+    rw = max(0.02, min(rw, 1.0 - rx))
+    rh = max(0.02, min(rh, 1.0 - ry))
+
+    return rx, ry, rw, rh
+
+# ---------------------------------------------------------------------------
+# Session cache: pre-processed YOLO results keyed by session_id.
+# Populated by /start, consumed by /plan-stream.
+# Entries expire after 120s to avoid memory leaks.
+# ---------------------------------------------------------------------------
+_session_cache: dict[str, dict] = {}
+_SESSION_TTL = 120  # seconds
+
+
+def _prune_sessions():
+    """Remove expired sessions from the cache."""
+    now = time.time()
+    expired = [sid for sid, v in _session_cache.items() if now - v["ts"] > _SESSION_TTL]
+    for sid in expired:
+        del _session_cache[sid]
 
 # SoM grid configuration — coarse grid for hybrid pipeline.
 # 6x4 = 24 markers — big, easy to read. LLM selects MULTIPLE markers
@@ -735,6 +828,71 @@ async def _refine_with_omniparser(
     )
 
 
+@router.post("/start")
+async def start_session(
+    request: Request,
+    image_size: str = Form(...),
+    screenshot: UploadFile = File(...),
+):
+    """
+    Pre-process a screenshot while the user is typing their goal.
+    Runs YOLO detection + annotated image generation eagerly.
+    Returns a session_id that /plan-stream can reference to skip YOLO.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    _prune_sessions()
+
+    try:
+        size_dict = json.loads(image_size)
+        parsed_size = ImageSize.model_validate(size_dict)
+    except (json.JSONDecodeError, Exception) as e:
+        raise HTTPException(status_code=422, detail=f"Invalid image_size JSON: {e}")
+
+    screenshot_bytes = await screenshot.read()
+    if len(screenshot_bytes) == 0:
+        raise HTTPException(status_code=422, detail="Screenshot file is empty")
+    if len(screenshot_bytes) > MAX_SCREENSHOT_BYTES:
+        raise HTTPException(status_code=413, detail="Screenshot exceeds 20 MB limit")
+
+    session_id = str(uuid4())
+    print(f"[start] rid={request_id} sid={session_id} running YOLO on {len(screenshot_bytes)} bytes")
+
+    # Run YOLO detection (the slow part we want to pre-compute)
+    elements = detect_elements(screenshot_bytes)
+    elements.sort(key=lambda e: (e.bbox_xyxy[1], e.bbox_xyxy[0]))
+    for i, e in enumerate(elements):
+        e.id = i
+
+    annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
+    elements_ctx = format_elements_context(elements)
+
+    # Upload images to Gemini File API so /plan-stream can skip base64 re-encoding
+    gemini_annotated_file = None
+    gemini_raw_file = None
+    if is_native_genai_available():
+        try:
+            gemini_annotated_file, gemini_raw_file = upload_images_to_gemini(
+                annotated_bytes, screenshot_bytes
+            )
+            print(f"[start] rid={request_id} sid={session_id} images uploaded to Gemini")
+        except Exception as e:
+            print(f"[start] rid={request_id} sid={session_id} Gemini upload failed (non-fatal): {e}")
+
+    _session_cache[session_id] = {
+        "elements": elements,
+        "annotated_bytes": annotated_bytes,
+        "elements_ctx": elements_ctx,
+        "screenshot_bytes": screenshot_bytes,
+        "image_size": parsed_size,
+        "gemini_annotated_file": gemini_annotated_file,
+        "gemini_raw_file": gemini_raw_file,
+        "ts": time.time(),
+    }
+
+    print(f"[start] rid={request_id} sid={session_id} cached {len(elements)} elements, gemini_files={'yes' if gemini_annotated_file else 'no'}")
+    return {"session_id": session_id, "element_count": len(elements)}
+
+
 @router.post("/plan", response_model=StepPlan)
 async def create_plan(
     request: Request,
@@ -822,8 +980,7 @@ async def create_plan(
             request_id=request_id,
         )
 
-        # ===== STEP 5: Convert Gemini response → StepPlan =====
-        elem_map = {e.id: e for e in elements}
+        # ===== STEP 5: Convert Gemini response → StepPlan with YOLO snapping =====
         converted_steps: list[Step] = []
 
         for step_data in result.get("steps", []):
@@ -833,50 +990,7 @@ async def create_plan(
             confidence = step_data.get("confidence", 0.5)
             advance_type = step_data.get("advance", "click_in_target")
 
-            # Try to get bbox from Gemini's native box_2d [ymin, xmin, ymax, xmax] / 1000
-            box_2d = step_data.get("box_2d")
-            element_id = step_data.get("element_id")
-
-            rx, ry, rw, rh = None, None, None, None
-
-            if box_2d and len(box_2d) == 4:
-                ymin, xmin, ymax, xmax = box_2d
-                rx = xmin / 1000.0
-                ry = ymin / 1000.0
-                rw = (xmax - xmin) / 1000.0
-                rh = (ymax - ymin) / 1000.0
-                print(f"[plan] rid={request_id} step={step_id} Gemini box_2d={box_2d} -> ({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
-
-                # Snap to nearest YOLO element for pixel-precise bbox
-                sx, sy, sw, sh, snap_id = snap_to_nearest_element(rx, ry, rw, rh, elements)
-                if snap_id is not None:
-                    print(f"[plan] rid={request_id} step={step_id} SNAPPED to YOLO elem[{snap_id}]=({sx:.3f},{sy:.3f},{sw:.3f},{sh:.3f})")
-                    rx, ry, rw, rh = sx, sy, sw, sh
-
-            # If Gemini referenced an element_id directly, use YOLO bbox
-            if rx is None and element_id is not None and element_id in elem_map:
-                elem = elem_map[element_id]
-                rx, ry, rw, rh = elem.bbox_xywh
-                print(f"[plan] rid={request_id} step={step_id} YOLO elem[{element_id}]=({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
-
-            # Fallback: center of screen
-            if rx is None:
-                rx, ry, rw, rh = 0.4, 0.4, 0.2, 0.2
-                print(f"[plan] rid={request_id} step={step_id} FALLBACK center-of-screen")
-
-            # Clamp
-            rx = max(0.0, min(rx, 1.0))
-            ry = max(0.0, min(ry, 1.0))
-            rw = max(0.02, min(rw, 1.0 - rx))
-            rh = max(0.02, min(rh, 1.0 - ry))
-
-            from app.schemas.step_plan import Advance, AdvanceType
-            advance_map = {
-                "click_in_target": AdvanceType.click_in_target,
-                "text_entered_or_next": AdvanceType.text_entered_or_next,
-                "manual_next": AdvanceType.manual_next,
-                "wait_for_ui_change": AdvanceType.wait_for_ui_change,
-            }
+            rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "plan")
 
             converted_steps.append(Step(
                 id=step_id,
@@ -887,7 +1001,7 @@ async def create_plan(
                     confidence=confidence,
                     label=label,
                 )],
-                advance=Advance(type=advance_map.get(advance_type, AdvanceType.click_in_target)),
+                advance=Advance(type=_ADVANCE_MAP.get(advance_type, AdvanceType.click_in_target)),
             ))
 
         plan = StepPlan(
@@ -928,53 +1042,96 @@ async def create_plan_stream(
     request: Request,
     goal: str = Form(...),
     image_size: str = Form(...),
-    screenshot: UploadFile = File(...),
+    screenshot: UploadFile = File(None),
     learning_profile: str = Form(None),
     app_context: str = Form(None),
     session_summary: str = Form(None),
     markers_json: str = Form(None),
+    session_id: str = Form(None),
 ):
     """
     Streaming version of /plan. Returns newline-delimited JSON (NDJSON):
       Line 1: {"type":"instruction","text":"Click on..."} — as soon as instruction is available
       Line 2: {"type":"plan","data":{...full StepPlan...}} — when complete
+
+    If session_id is provided (from /start), uses cached YOLO results — skips detection.
     """
     request_id = getattr(request.state, "request_id", "unknown")
-    print(f"[plan-stream] rid={request_id} goal={goal!r}")
+    print(f"[plan-stream] rid={request_id} goal={goal!r} session_id={session_id!r}")
 
-    try:
-        size_dict = json.loads(image_size)
-        parsed_size = ImageSize.model_validate(size_dict)
-    except (json.JSONDecodeError, Exception) as e:
-        raise HTTPException(status_code=422, detail=f"Invalid image_size JSON: {e}")
+    # Try to use cached session from /start
+    cached = _session_cache.pop(session_id, None) if session_id else None
 
-    screenshot_bytes = await screenshot.read()
-    if len(screenshot_bytes) == 0:
-        raise HTTPException(status_code=422, detail="Screenshot file is empty")
+    if cached and time.time() - cached["ts"] < _SESSION_TTL:
+        screenshot_bytes = cached["screenshot_bytes"]
+        parsed_size = cached["image_size"]
+        prefetched_elements = cached["elements"]
+        prefetched_annotated = cached["annotated_bytes"]
+        prefetched_ctx = cached["elements_ctx"]
+        gemini_annotated_file = cached.get("gemini_annotated_file")
+        gemini_raw_file = cached.get("gemini_raw_file")
+        # Consume the uploaded file to avoid resource leaks
+        if screenshot is not None:
+            await screenshot.read()
+        print(f"[plan-stream] rid={request_id} using cached session {session_id} ({len(prefetched_elements)} elements, gemini_files={'yes' if gemini_annotated_file else 'no'})")
+    else:
+        prefetched_elements = None
+        prefetched_annotated = None
+        prefetched_ctx = None
+        gemini_annotated_file = None
+        gemini_raw_file = None
+        try:
+            size_dict = json.loads(image_size)
+            parsed_size = ImageSize.model_validate(size_dict)
+        except (json.JSONDecodeError, Exception) as e:
+            raise HTTPException(status_code=422, detail=f"Invalid image_size JSON: {e}")
+        if screenshot is None:
+            raise HTTPException(status_code=422, detail="No screenshot and no valid session_id")
+        screenshot_bytes = await screenshot.read()
+        if len(screenshot_bytes) == 0:
+            raise HTTPException(status_code=422, detail="Screenshot file is empty")
 
     async def event_stream():
         try:
-            # YOLO on full screenshot
-            elements = detect_elements(screenshot_bytes)
-            elements.sort(key=lambda e: (e.bbox_xyxy[1], e.bbox_xyxy[0]))
-            for i, e in enumerate(elements):
-                e.id = i
+            # Use prefetched YOLO results if available, else run fresh
+            if prefetched_elements is not None:
+                elements = prefetched_elements
+                annotated_bytes = prefetched_annotated
+                elements_ctx = prefetched_ctx
+            else:
+                elements = detect_elements(screenshot_bytes)
+                elements.sort(key=lambda e: (e.bbox_xyxy[1], e.bbox_xyxy[0]))
+                for i, e in enumerate(elements):
+                    e.id = i
+                annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
+                elements_ctx = format_elements_context(elements)
 
-            annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
-            elements_ctx = format_elements_context(elements)
             elem_map = {e.id: e for e in elements}
 
-            # Stream Gemini response
-            from app.services.agent import generate_gemini_plan_stream
+            # Choose streaming path: native Gemini files (fast) or OpenAI-compat (fallback)
+            if gemini_annotated_file is not None and gemini_raw_file is not None:
+                from app.services.agent import generate_gemini_plan_with_files_stream
+                stream_gen = generate_gemini_plan_with_files_stream(
+                    goal=goal,
+                    annotated_file=gemini_annotated_file,
+                    raw_file=gemini_raw_file,
+                    elements_context=elements_ctx,
+                    request_id=request_id,
+                )
+                print(f"[plan-stream] rid={request_id} using native Gemini files path (fast)")
+            else:
+                from app.services.agent import generate_gemini_plan_stream
+                stream_gen = generate_gemini_plan_stream(
+                    goal=goal,
+                    annotated_screenshot_bytes=annotated_bytes,
+                    raw_screenshot_bytes=screenshot_bytes,
+                    elements_context=elements_ctx,
+                    request_id=request_id,
+                )
+                print(f"[plan-stream] rid={request_id} using OpenAI-compat path (fallback)")
 
             full_result = None
-            async for event in generate_gemini_plan_stream(
-                goal=goal,
-                annotated_screenshot_bytes=annotated_bytes,
-                raw_screenshot_bytes=screenshot_bytes,
-                elements_context=elements_ctx,
-                request_id=request_id,
-            ):
+            async for event in stream_gen:
                 if event["type"] == "instruction":
                     yield json.dumps({"type": "instruction", "text": event["text"]}) + "\n"
 
@@ -985,15 +1142,7 @@ async def create_plan_stream(
                 yield json.dumps({"type": "error", "message": "No plan generated"}) + "\n"
                 return
 
-            # Convert Gemini result → StepPlan (same logic as /plan)
-            from app.schemas.step_plan import Advance, AdvanceType
-            advance_map = {
-                "click_in_target": AdvanceType.click_in_target,
-                "text_entered_or_next": AdvanceType.text_entered_or_next,
-                "manual_next": AdvanceType.manual_next,
-                "wait_for_ui_change": AdvanceType.wait_for_ui_change,
-            }
-
+            # Convert Gemini result → StepPlan with YOLO snapping
             converted_steps = []
             for step_data in full_result.get("steps", []):
                 step_id = step_data.get("id", f"s{len(converted_steps) + 1}")
@@ -1002,36 +1151,13 @@ async def create_plan_stream(
                 confidence = step_data.get("confidence", 0.5)
                 advance_type = step_data.get("advance", "click_in_target")
 
-                box_2d = step_data.get("box_2d")
-                element_id = step_data.get("element_id")
-                rx, ry, rw, rh = None, None, None, None
-
-                if box_2d and len(box_2d) == 4:
-                    ymin, xmin, ymax, xmax = box_2d
-                    rx = xmin / 1000.0
-                    ry = ymin / 1000.0
-                    rw = (xmax - xmin) / 1000.0
-                    rh = (ymax - ymin) / 1000.0
-                    sx, sy, sw, sh, snap_id = snap_to_nearest_element(rx, ry, rw, rh, elements)
-                    if snap_id is not None:
-                        rx, ry, rw, rh = sx, sy, sw, sh
-
-                if rx is None and element_id is not None and element_id in elem_map:
-                    rx, ry, rw, rh = elem_map[element_id].bbox_xywh
-
-                if rx is None:
-                    rx, ry, rw, rh = 0.4, 0.4, 0.2, 0.2
-
-                rx = max(0.0, min(rx, 1.0))
-                ry = max(0.0, min(ry, 1.0))
-                rw = max(0.02, min(rw, 1.0 - rx))
-                rh = max(0.02, min(rh, 1.0 - ry))
+                rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "plan-stream")
 
                 converted_steps.append(Step(
                     id=step_id,
                     instruction=instruction,
                     targets=[TargetRect(type=TargetType.bbox_norm, x=rx, y=ry, w=rw, h=rh, confidence=confidence, label=label)],
-                    advance=Advance(type=advance_map.get(advance_type, AdvanceType.click_in_target)),
+                    advance=Advance(type=_ADVANCE_MAP.get(advance_type, AdvanceType.click_in_target)),
                 ))
 
             plan = StepPlan(version="v1", goal=goal, image_size=parsed_size, steps=converted_steps)

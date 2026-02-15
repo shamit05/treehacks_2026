@@ -59,6 +59,10 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OverlayGuide uses the microphone for voice input so you can speak your goal instead of typing.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>OverlayGuide uses speech recognition to convert your voice into text for goal input.</string>
 </dict>
 </plist>
 EOF

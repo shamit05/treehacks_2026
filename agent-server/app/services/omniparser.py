@@ -245,20 +245,21 @@ def draw_numbered_boxes(
         # Draw bounding box
         draw.rectangle([x1, y1, x2, y2], outline=color, width=border_width)
 
-        # Draw number label with big, bold background
+        # Draw number label INSIDE the box at top-left corner.
+        # Previously drawn ABOVE the box, which caused the label for element N
+        # to overlap element N-1 in stacked layouts (menus, lists), making the
+        # LLM pick the wrong element (off-by-one).
         label = str(elem.id)
         label_bbox = draw.textbbox((0, 0), label, font=font)
-        lw = label_bbox[2] - label_bbox[0] + 12
-        lh = label_bbox[3] - label_bbox[1] + 8
+        lw = label_bbox[2] - label_bbox[0] + 10
+        lh = label_bbox[3] - label_bbox[1] + 6
 
-        # Position label at top-left of bbox
+        # Place label at the top-left corner of the bbox, inside the box
         lx = max(0, x1)
-        ly = max(0, y1 - lh - 2)
-        if ly < 0:
-            ly = y1
+        ly = max(0, y1)
 
         draw.rectangle([lx, ly, lx + lw, ly + lh], fill=color)
-        draw.text((lx + 6, ly + 4), label, fill=(255, 255, 255), font=font)
+        draw.text((lx + 5, ly + 3), label, fill=(255, 255, 255), font=font)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -423,12 +424,17 @@ async def _parse_via_gradio(
 def snap_to_nearest_element(
     gemini_x: float, gemini_y: float, gemini_w: float, gemini_h: float,
     elements: list[OmniElement],
-    max_distance: float = 0.04,
+    max_distance: float = 0.06,
 ) -> tuple[float, float, float, float, int | None]:
     """
-    Find the YOLO element whose center is closest to the center of Gemini's
-    bounding box.  If within max_distance, return the YOLO element's bbox
-    (more precise).  Otherwise return the original Gemini coords.
+    Find the YOLO element that best matches Gemini's bounding box.
+
+    Three-pass strategy optimized for dropdown menus and stacked items:
+      1. Center containment: which YOLO element's bbox contains the center
+         of Gemini's box? Pick the smallest (tightest fit). This is the most
+         precise for dropdown menus where items are stacked vertically.
+      2. IoU: best for overlapping boxes of similar size.
+      3. Center-distance: fallback for near-miss cases.
 
     Returns (x, y, w, h, matched_element_id).
     """
@@ -437,12 +443,77 @@ def snap_to_nearest_element(
 
     gcx = gemini_x + gemini_w / 2
     gcy = gemini_y + gemini_h / 2
+    gx1 = gemini_x
+    gy1 = gemini_y
+    gx2 = gemini_x + gemini_w
+    gy2 = gemini_y + gemini_h
+    g_area = gemini_w * gemini_h
 
+    # Size threshold: don't snap to elements that are much smaller than Gemini's box.
+    # This prevents matching random tiny icons when the target is a menu item or button.
+    gemini_area = g_area if g_area > 0 else 0.0001
+    min_area_ratio = 0.15  # YOLO element must be at least 15% the area of Gemini's box
+
+    # --- Pass 1: Center containment (best for dropdown menus) ---
+    # Find all YOLO elements whose bbox contains the CENTER of Gemini's box.
+    # Among matches, pick the smallest (most specific) element that isn't too tiny.
+    containment_matches = []
+    for elem in elements:
+        ex, ey, ew, eh = elem.bbox_xywh
+        e_area = ew * eh
+        if (ex <= gcx <= ex + ew) and (ey <= gcy <= ey + eh):
+            # Skip elements that are much smaller than Gemini's box
+            if e_area / gemini_area >= min_area_ratio:
+                containment_matches.append((e_area, elem))
+
+    if containment_matches:
+        # Pick smallest containing element (tightest fit around the center)
+        containment_matches.sort(key=lambda x: x[0])
+        best = containment_matches[0][1]
+        ex, ey, ew, eh = best.bbox_xywh
+        print(f"[snap] center-containment -> elem[{best.id}] ({ex:.3f},{ey:.3f},{ew:.3f},{eh:.3f}) [{len(containment_matches)} candidates]")
+        return ex, ey, ew, eh, best.id
+
+    # --- Pass 2: IoU-based matching (skip tiny elements) ---
+    best_iou_elem = None
+    best_iou = 0.0
+
+    for elem in elements:
+        ex, ey, ew, eh = elem.bbox_xywh
+        e_area = ew * eh
+        # Skip elements much smaller than Gemini's box
+        if e_area / gemini_area < min_area_ratio:
+            continue
+        ex1, ey1 = ex, ey
+        ex2, ey2 = ex + ew, ey + eh
+
+        ix1 = max(gx1, ex1)
+        iy1 = max(gy1, ey1)
+        ix2 = min(gx2, ex2)
+        iy2 = min(gy2, ey2)
+
+        if ix2 > ix1 and iy2 > iy1:
+            inter_area = (ix2 - ix1) * (iy2 - iy1)
+            union_area = g_area + e_area - inter_area
+            iou = inter_area / union_area if union_area > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best_iou_elem = elem
+
+    if best_iou_elem is not None and best_iou > 0.05:
+        ex, ey, ew, eh = best_iou_elem.bbox_xywh
+        print(f"[snap] IoU={best_iou:.2f} -> elem[{best_iou_elem.id}] ({ex:.3f},{ey:.3f},{ew:.3f},{eh:.3f})")
+        return ex, ey, ew, eh, best_iou_elem.id
+
+    # --- Pass 3: Center-distance fallback (skip tiny elements) ---
     best_elem = None
     best_dist = float("inf")
 
     for elem in elements:
         ex, ey, ew, eh = elem.bbox_xywh
+        e_area = ew * eh
+        if e_area / gemini_area < min_area_ratio:
+            continue
         ecx = ex + ew / 2
         ecy = ey + eh / 2
         dist = ((gcx - ecx) ** 2 + (gcy - ecy) ** 2) ** 0.5
@@ -452,8 +523,13 @@ def snap_to_nearest_element(
 
     if best_elem is not None and best_dist <= max_distance:
         ex, ey, ew, eh = best_elem.bbox_xywh
+        print(f"[snap] center-dist={best_dist:.4f} -> elem[{best_elem.id}] ({ex:.3f},{ey:.3f},{ew:.3f},{eh:.3f})")
         return ex, ey, ew, eh, best_elem.id
 
+    # --- No suitable YOLO match: use Gemini's raw coordinates ---
+    # This is the right call for dropdown menus where YOLO doesn't detect
+    # the menu items (only tiny icons within them).
+    print(f"[snap] NO SNAP — using Gemini raw box ({gemini_x:.3f},{gemini_y:.3f},{gemini_w:.3f},{gemini_h:.3f})")
     return gemini_x, gemini_y, gemini_w, gemini_h, None
 
 

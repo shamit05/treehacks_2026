@@ -22,13 +22,48 @@ class AgentNetworkClient {
         self.session = URLSession(configuration: config)
     }
 
+    /// POST /start — pre-send screenshot for YOLO processing while user types.
+    /// Returns a session_id that can be passed to requestPlanStream to skip YOLO.
+    func startSession(
+        screenshotData: Data,
+        imageSize: ImageSize
+    ) async throws -> String {
+        let url = baseURL.appendingPathComponent("start")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+
+        let requestId = UUID().uuidString
+        request.setValue(requestId, forHTTPHeaderField: "X-Request-ID")
+        print("[Network] POST /start requestId=\(requestId)")
+
+        let boundary = UUID().uuidString
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        var body = Data()
+        let imageSizeJSON = try JSONEncoder().encode(imageSize)
+        body.appendMultipart(name: "image_size", value: String(data: imageSizeJSON, encoding: .utf8)!, boundary: boundary)
+        body.appendMultipartFile(name: "screenshot", filename: "screenshot.png", mimeType: "image/png", data: screenshotData, boundary: boundary)
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        request.httpBody = body
+
+        let data = try await sendWithRetry(request: request, maxRetries: 0)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sessionId = json["session_id"] as? String else {
+            throw NetworkError.badResponse
+        }
+        print("[Network] /start session_id=\(sessionId)")
+        return sessionId
+    }
+
     /// POST /plan-stream — streaming version that yields instruction text early, then full plan.
     /// Calls onInstruction as soon as the instruction text is available (before bbox).
     /// Returns the full StepPlan when complete.
+    /// If sessionId is provided (from /start), the server skips YOLO and uses cached results.
     func requestPlanStream(
         goal: String,
-        screenshotData: Data,
+        screenshotData: Data?,
         imageSize: ImageSize,
+        sessionId: String? = nil,
         learningProfile: LearningProfile? = nil,
         appContext: AppContext? = nil,
         onInstruction: @escaping (String) -> Void
@@ -39,7 +74,7 @@ class AgentNetworkClient {
 
         let requestId = UUID().uuidString
         request.setValue(requestId, forHTTPHeaderField: "X-Request-ID")
-        print("[Network] POST /plan-stream requestId=\(requestId)")
+        print("[Network] POST /plan-stream requestId=\(requestId) sessionId=\(sessionId ?? "none")")
 
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -48,6 +83,9 @@ class AgentNetworkClient {
         body.appendMultipart(name: "goal", value: goal, boundary: boundary)
         let imageSizeJSON = try JSONEncoder().encode(imageSize)
         body.appendMultipart(name: "image_size", value: String(data: imageSizeJSON, encoding: .utf8)!, boundary: boundary)
+        if let sid = sessionId {
+            body.appendMultipart(name: "session_id", value: sid, boundary: boundary)
+        }
         if let profile = learningProfile {
             body.appendMultipart(name: "learning_profile", value: profile.text, boundary: boundary)
         }
@@ -55,7 +93,9 @@ class AgentNetworkClient {
             let contextJSON = try JSONEncoder().encode(context)
             body.appendMultipart(name: "app_context", value: String(data: contextJSON, encoding: .utf8)!, boundary: boundary)
         }
-        body.appendMultipartFile(name: "screenshot", filename: "screenshot.png", mimeType: "image/png", data: screenshotData, boundary: boundary)
+        if let screenshotData {
+            body.appendMultipartFile(name: "screenshot", filename: "screenshot.png", mimeType: "image/png", data: screenshotData, boundary: boundary)
+        }
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         request.httpBody = body
 

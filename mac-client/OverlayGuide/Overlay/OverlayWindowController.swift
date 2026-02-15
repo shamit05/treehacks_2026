@@ -20,7 +20,7 @@ class OverlayWindowController {
     private let stateMachine: GuidanceStateMachine
     private var window: NSPanel?
     private var highlightPanel: NSPanel?
-    private let popupSize = NSSize(width: 460, height: 320)
+    private let popupSize = NSSize(width: 420, height: 280)
 
     init(stateMachine: GuidanceStateMachine) {
         self.stateMachine = stateMachine
@@ -49,7 +49,7 @@ class OverlayWindowController {
                 rootView: OverlayContentView(stateMachine: stateMachine)
             )
             hostingView.wantsLayer = true
-            hostingView.layer?.cornerRadius = 20
+            hostingView.layer?.cornerRadius = 16
             hostingView.layer?.masksToBounds = true
             window!.contentView = hostingView
         }
@@ -131,6 +131,18 @@ class OverlayWindowController {
     }
 
     private func updateHighlightPanels(for phase: GuidancePhase) {
+        // Only show highlight overlay during guiding and loading phases.
+        // Hide it during completed/error/inputGoal so the popup buttons
+        // are clickable (highlight panel is at .screenSaver level and
+        // would otherwise sit above the popup panel).
+        switch phase {
+        case .guiding, .loading:
+            break
+        default:
+            highlightPanel?.orderOut(nil)
+            return
+        }
+
         let targetBounds = stateMachine.capturedScreenBounds
             ?? NSScreen.main?.frame
             ?? NSScreen.screens.first?.frame

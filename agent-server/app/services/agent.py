@@ -10,9 +10,20 @@ import base64
 import json
 import os
 import re
+import tempfile
+import time
 from pathlib import Path
 
 from openai import AsyncOpenAI
+
+# Native Gemini SDK — used for file upload + pre-cached image generation.
+# Falls back to OpenAI-compatible endpoint when unavailable.
+try:
+    import google.generativeai as genai
+    _genai_available = True
+except ImportError:
+    genai = None
+    _genai_available = False
 
 from app.schemas.step_plan import (
     BBoxNorm,
@@ -1011,10 +1022,27 @@ async def generate_gemini_plan_stream(
                         instruction_sent = True
                         yield {"type": "instruction", "text": m.group(1)}
 
-    # Full response complete — parse and yield
+    # Full response complete — parse and yield (with retry on bad JSON)
     print(f"[agent] rid={request_id} gemini-plan-stream complete, length={len(buffer)}")
-    result = _extract_json(buffer)
-    yield {"type": "plan", "data": result}
+    try:
+        result = _extract_json(buffer)
+        yield {"type": "plan", "data": result}
+    except AgentError as parse_err:
+        print(f"[agent] rid={request_id} gemini-plan-stream JSON parse failed: {parse_err}, retrying non-streaming...")
+        # Retry once with a fresh non-streaming call
+        try:
+            result = await generate_gemini_plan(
+                goal=goal,
+                annotated_screenshot_bytes=annotated_screenshot_bytes,
+                raw_screenshot_bytes=raw_screenshot_bytes,
+                elements_context=elements_context,
+                request_id=request_id + "-retry",
+            )
+            # generate_gemini_plan returns a dict (already parsed)
+            yield {"type": "plan", "data": result}
+        except Exception as retry_err:
+            print(f"[agent] rid={request_id} gemini-plan-stream retry also failed: {retry_err}")
+            raise parse_err
 
 
 # ---------------------------------------------------------------------------
@@ -1064,3 +1092,159 @@ async def generate_gemini_next(
     result = _extract_json(raw_text)
     print(f"[agent] rid={request_id} gemini-next: status={result.get('status')} steps={len(result.get('steps', []))}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Native Gemini SDK: file upload + generation with pre-uploaded images
+# ---------------------------------------------------------------------------
+
+_genai_configured = False
+
+
+def _ensure_genai():
+    """Configure the native Gemini SDK (lazy, once)."""
+    global _genai_configured
+    if not _genai_available:
+        raise RuntimeError("google-generativeai not installed")
+    if _genai_configured:
+        return
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    genai.configure(api_key=key)
+    _genai_configured = True
+    print("[agent] Gemini native SDK configured")
+
+
+def is_native_genai_available() -> bool:
+    """Check if native Gemini file upload is available."""
+    return _genai_available and bool(os.getenv("GEMINI_API_KEY"))
+
+
+def _wait_for_file_active(f):
+    """Poll a Gemini file until it's done processing."""
+    while f.state.name == "PROCESSING":
+        time.sleep(0.3)
+        f = genai.get_file(f.name)
+    return f
+
+
+def upload_images_to_gemini(
+    annotated_bytes: bytes,
+    raw_bytes: bytes,
+) -> tuple:
+    """
+    Upload annotated + raw screenshots to Gemini File API.
+    Files persist on Google's servers for 48h — no re-upload needed.
+    Returns (annotated_file, raw_file) objects usable in generate_content().
+    """
+    _ensure_genai()
+
+    # Write to temp files (SDK needs file paths)
+    paths = []
+    try:
+        for label, data in [("annotated", annotated_bytes), ("raw", raw_bytes)]:
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.write(data)
+            tmp.close()
+            paths.append(tmp.name)
+
+        annotated_file = genai.upload_file(paths[0], mime_type="image/png")
+        raw_file = genai.upload_file(paths[1], mime_type="image/png")
+
+        # Poll until processing completes (usually instant for images)
+        annotated_file = _wait_for_file_active(annotated_file)
+        raw_file = _wait_for_file_active(raw_file)
+
+        print(f"[agent] Uploaded to Gemini: annotated={annotated_file.name} raw={raw_file.name}")
+        return annotated_file, raw_file
+
+    finally:
+        for p in paths:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+
+async def generate_gemini_plan_with_files_stream(
+    goal: str,
+    annotated_file,
+    raw_file,
+    elements_context: str,
+    request_id: str = "",
+):
+    """
+    Streaming plan generation using pre-uploaded Gemini files.
+    Since images are already on Google's servers, this skips the
+    ~3-8MB base64 upload and starts generating immediately.
+    Yields same events as generate_gemini_plan_stream.
+    """
+    _ensure_genai()
+
+    prompt = _GEMINI_PLAN_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context or "(no elements detected)")
+
+    model_name = os.getenv("OPENAI_MODEL", "gemini-3-flash-preview")
+    model = genai.GenerativeModel(model_name)
+
+    print(f"[agent] rid={request_id} gemini-plan-files-stream model={model_name}")
+
+    contents = [prompt, annotated_file, raw_file]
+
+    buffer = ""
+    instruction_sent = False
+
+    async with _llm_semaphore:
+        response = await model.generate_content_async(
+            contents,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                max_output_tokens=2000,
+                temperature=0.1,
+            ),
+            stream=True,
+        )
+
+        async for chunk in response:
+            text = ""
+            try:
+                text = chunk.text or ""
+            except Exception:
+                pass
+            if text:
+                buffer += text
+
+                # Try to extract instruction early from partial JSON
+                if not instruction_sent and '"instruction"' in buffer:
+                    m = re.search(r'"instruction"\s*:\s*"([^"]*)"', buffer)
+                    if m:
+                        instruction_sent = True
+                        yield {"type": "instruction", "text": m.group(1)}
+
+    # Full response complete — parse and yield (with retry on bad JSON)
+    print(f"[agent] rid={request_id} gemini-plan-files-stream complete, length={len(buffer)}")
+    print(f"[agent] rid={request_id} raw buffer: {buffer[:500]!r}")
+    try:
+        result = _extract_json(buffer)
+        yield {"type": "plan", "data": result}
+    except AgentError as parse_err:
+        print(f"[agent] rid={request_id} gemini-plan-files-stream JSON parse failed: {parse_err}, retrying...")
+        # Retry once using the same files + non-streaming native call
+        try:
+            retry_response = await model.generate_content_async(
+                contents,
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=2000,
+                    temperature=0.1,
+                ),
+            )
+            retry_text = retry_response.text or ""
+            print(f"[agent] rid={request_id} retry response length={len(retry_text)}")
+            result = _extract_json(retry_text)
+            yield {"type": "plan", "data": result}
+        except Exception as retry_err:
+            print(f"[agent] rid={request_id} retry also failed: {retry_err}")
+            raise parse_err

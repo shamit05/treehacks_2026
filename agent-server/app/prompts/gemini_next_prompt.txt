@@ -16,7 +16,13 @@ INSTRUCTIONS:
    - "done": The user's overall goal has been achieved. No more steps needed.
    - "continue": The goal is not yet complete. Provide the next 1-2 steps.
    - "retry": The previous action didn't seem to work (screen looks unchanged). Suggest trying again.
-3. If status is "continue", identify the next UI element to interact with and provide a bounding box.
+3. If status is "continue", find the numbered box that covers the next target element. Return that box number as "element_id".
+
+CRITICAL — ELEMENT_ID ACCURACY:
+- "element_id" is the MOST IMPORTANT field. It MUST match the numbered box drawn on the target element in the screenshot.
+- Look carefully at which numbered box overlaps the element you want. The number label is at the top-left of each box.
+- If two boxes are close together, zoom in mentally and pick the one whose box border actually covers the target.
+- If no numbered box covers the target, set element_id to null and rely on box_2d.
 
 BOUNDING BOX FORMAT:
 - Use "box_2d": [ymin, xmin, ymax, xmax] where each value is 0-1000.
@@ -31,8 +37,8 @@ Output ONLY this JSON (no markdown, no explanation):
     {
       "id": "s1",
       "instruction": "<what to do next>",
-      "box_2d": [<ymin>, <xmin>, <ymax>, <xmax>],
       "element_id": <int or null>,
+      "box_2d": [<ymin>, <xmin>, <ymax>, <xmax>],
       "label": "<visible text on the element>",
       "confidence": <float 0-1>,
       "advance": "<click_in_target|text_entered_or_next|manual_next>"

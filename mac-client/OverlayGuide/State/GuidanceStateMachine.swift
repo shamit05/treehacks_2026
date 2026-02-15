@@ -33,6 +33,16 @@ class GuidanceStateMachine: ObservableObject {
     @Published private(set) var capturedScreenBounds: CGRect?
     @Published var completionMessage: String?
     @Published var loadingStatus: String = "Processing screen..."
+    /// The goal text shown as header after submission
+    @Published var submittedGoal: String?
+    /// Instruction text streamed from the server before the full plan arrives
+    @Published var streamingInstruction: String?
+
+    // MARK: - Pre-loaded screenshot (captured when pane opens)
+
+    private var preloadedScreenshot: ScreenshotResult?
+    private var preloadedSessionId: String?
+    private var preloadTask: Task<Void, Never>?
 
     // MARK: - Session
 
@@ -63,6 +73,8 @@ class GuidanceStateMachine: ObservableObject {
     func toggleOverlay() {
         switch phase {
         case .idle:
+            // Capture screenshot + start YOLO BEFORE showing overlay
+            preloadScreenshot()
             phase = .inputGoal
         case .inputGoal, .guiding, .completed, .error:
             reset()
@@ -78,28 +90,73 @@ class GuidanceStateMachine: ObservableObject {
         currentStepIndex = 0
         hintMessage = nil
         capturedScreenBounds = nil
+        submittedGoal = nil
+        streamingInstruction = nil
+        preloadScreenshot()
         phase = .inputGoal
+    }
+
+    /// Capture a clean screenshot and send to /start for pre-processing.
+    /// Runs in background while the user types their goal.
+    private func preloadScreenshot() {
+        preloadedScreenshot = nil
+        preloadedSessionId = nil
+        preloadTask?.cancel()
+        preloadTask = Task { @MainActor in
+            do {
+                let screenshot = try await captureService.captureMainDisplay()
+                self.preloadedScreenshot = screenshot
+                self.capturedScreenBounds = screenshot.screenBounds
+                print("[State] Pre-captured screenshot: \(screenshot.imageData.count) bytes")
+
+                // Send to /start for YOLO processing while user types
+                let imgSize = ImageSize(
+                    w: Int(screenshot.screenBounds.width),
+                    h: Int(screenshot.screenBounds.height)
+                )
+                let sessionId = try await networkClient.startSession(
+                    screenshotData: screenshot.imageData,
+                    imageSize: imgSize
+                )
+                self.preloadedSessionId = sessionId
+                print("[State] Pre-processed session: \(sessionId)")
+            } catch {
+                print("[State] Pre-capture/start failed (non-fatal): \(error)")
+            }
+        }
     }
 
     /// User submitted a goal
     func submitGoal(_ goal: String) {
         guard phase == .inputGoal else { return }
         session.goal = goal
-        // Hide overlay before capture so the popup is never included in the screenshot.
-        phase = .idle
+        submittedGoal = goal
+        streamingInstruction = nil
+        loadingStatus = "Analyzing screen..."
+        phase = .loading
 
         Task { @MainActor in
             do {
-                // Give the window system a moment to fully remove overlay windows.
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                // Use pre-loaded screenshot + session if available
+                let screenshot: ScreenshotResult
+                let sessionId: String?
 
-                // Capture FIRST, before showing any loading UI
-                let screenshot = try await captureService.captureMainDisplay()
-                self.capturedScreenBounds = screenshot.screenBounds
+                if let preloaded = preloadedScreenshot {
+                    screenshot = preloaded
+                    sessionId = preloadedSessionId
+                    print("[State] Using pre-loaded screenshot + session \(sessionId ?? "nil")")
+                } else {
+                    // Fallback: capture fresh (shouldn't happen often)
+                    // Need to briefly hide overlay for clean capture
+                    phase = .idle
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    screenshot = try await captureService.captureMainDisplay()
+                    self.capturedScreenBounds = screenshot.screenBounds
+                    loadingStatus = "Analyzing screen..."
+                    phase = .loading
+                    sessionId = nil
+                }
 
-                // NOW show loading UI (after screenshot is captured clean)
-                loadingStatus = "Analyzing screen..."
-                self.phase = .loading
                 let imgSize = ImageSize(
                     w: Int(screenshot.screenBounds.width),
                     h: Int(screenshot.screenBounds.height)
@@ -107,21 +164,24 @@ class GuidanceStateMachine: ObservableObject {
 
                 saveDebugArtifacts(goal: goal, screenshotData: screenshot.imageData)
 
-                loadingStatus = "Analyzing screen..."
-
                 // Progressive status updates while waiting
                 Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 4_000_000_000)
-                    if self.phase == .loading { self.loadingStatus = "Almost ready..." }
+                    try? await Task.sleep(nanoseconds: 6_000_000_000)
+                    if self.phase == .loading && self.streamingInstruction == nil {
+                        self.loadingStatus = "Almost ready..."
+                    }
                 }
 
+                // Always send screenshot as fallback in case session expired server-side
                 let plan = try await networkClient.requestPlanStream(
                     goal: goal,
                     screenshotData: screenshot.imageData,
                     imageSize: imgSize,
+                    sessionId: sessionId,
                     learningProfile: session.learningProfile,
                     onInstruction: { [weak self] instruction in
-                        // Show instruction text immediately (before bbox arrives)
+                        // Show instruction text immediately in the UI (before bbox arrives)
+                        self?.streamingInstruction = instruction
                         self?.loadingStatus = instruction
                     }
                 )
@@ -363,6 +423,12 @@ class GuidanceStateMachine: ObservableObject {
         completionMessage = nil
         capturedScreenBounds = nil
         completedSteps = []
+        submittedGoal = nil
+        streamingInstruction = nil
+        preloadedScreenshot = nil
+        preloadedSessionId = nil
+        preloadTask?.cancel()
+        preloadTask = nil
         session = SessionSnapshot(
             sessionId: UUID(),
             goal: "",
