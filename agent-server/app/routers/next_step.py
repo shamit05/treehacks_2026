@@ -20,6 +20,7 @@ from app.schemas.step_plan import (
     TargetType,
 )
 from app.services.agent import AgentError, generate_gemini_next
+from app.services.debug import DebugSession
 from app.services.mock import get_mock_next_step
 from app.services.omniparser import detect_elements, draw_numbered_boxes, format_elements_context, snap_to_nearest_element
 from app.services.search import get_stored_search_context
@@ -89,6 +90,9 @@ async def next_step(
     if search_context:
         print(f"[next] rid={request_id} using {len(search_context)} chars of stored search context")
 
+    # --- Debug session ---
+    dbg = DebugSession(request_id, goal=goal, endpoint="next")
+
     try:
         # --- YOLO on fresh screenshot ---
         elements = detect_elements(screenshot_bytes)
@@ -101,14 +105,12 @@ async def next_step(
         annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
         elements_ctx = format_elements_context(elements)
 
-        # Save debug images
-        try:
-            with open("/tmp/og_next_screenshot.png", "wb") as f:
-                f.write(screenshot_bytes)
-            with open("/tmp/og_next_yolo_annotated.png", "wb") as f:
-                f.write(annotated_bytes)
-        except Exception:
-            pass
+        dbg.save_image("screenshot", screenshot_bytes)
+        dbg.save_image("yolo_annotated", annotated_bytes, f"{len(elements)} elements")
+        dbg.save_text("yolo_elements", elements_ctx)
+        dbg.save_text("completed_steps_summary", completed_summary)
+        if search_context:
+            dbg.save_text("search_context", search_context)
 
         # --- Single Gemini call ---
         result = await generate_gemini_next(
@@ -122,6 +124,17 @@ async def next_step(
             request_id=request_id,
             search_context=search_context,
         )
+
+        # Save prompt + raw response
+        debug_meta = result.pop("_debug", {})
+        if debug_meta:
+            dbg.save_prompt_and_response(
+                "gemini_next",
+                prompt=debug_meta.get("prompt", ""),
+                response=debug_meta.get("raw_response", ""),
+                model=debug_meta.get("model", ""),
+            )
+        dbg.save_json("gemini_parsed_output", result)
 
         status = result.get("status", "done")
         message = result.get("message")
@@ -137,12 +150,17 @@ async def next_step(
                 advance_type = step_data.get("advance", "click_in_target")
                 reasoning = step_data.get("reasoning", "")
 
-                # Log Gemini's reasoning for debugging element selection
                 if reasoning:
                     print(f"[next] rid={request_id} step={step_id} REASONING: {reasoning}")
                 print(f"[next] rid={request_id} step={step_id} element_id={step_data.get('element_id')} box_2d={step_data.get('box_2d')} label={label!r}")
 
                 rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "next")
+
+                dbg.save_step_resolution(
+                    step_id=step_id,
+                    step_data=step_data,
+                    resolved_bbox=(rx, ry, rw, rh),
+                )
 
                 converted_steps.append(Step(
                     id=step_id,
@@ -166,6 +184,7 @@ async def next_step(
         )
 
         print(f"[next] rid={request_id} status={status} steps={len(converted_steps)} message={message!r}")
+        dbg.finalize(response.model_dump())
         return response
 
     except AgentError as e:

@@ -77,8 +77,8 @@ async def _generate_search_queries(
         "instructions, documentation, or relevant how-to guides.\n\n"
         f"Goal: {goal}\n"
         f"App context: {app_context or 'unknown'}\n\n"
-        "Output ONLY a JSON array of query strings. Example: "
-        '["how to enable dark mode in Photoshop", "Photoshop preferences panel"]\n'
+        'Output ONLY a JSON object with a "queries" key. Example:\n'
+        '{"queries": ["how to enable dark mode in Photoshop", "Photoshop preferences panel"]}\n'
         "No other text."
     )
 
@@ -107,6 +107,7 @@ async def _generate_search_queries(
 
     try:
         params = _model_params(model, 200)
+        # Use json_object mode — we now ask for {"queries": [...]} which is object-rooted
         extra_kwargs = {}
         if _supports_json_mode(model):
             extra_kwargs["response_format"] = {"type": "json_object"}
@@ -118,15 +119,36 @@ async def _generate_search_queries(
             **extra_kwargs,
         )
 
-        raw = response.choices[0].message.content or "[]"
+        raw = response.choices[0].message.content or "{}"
         # Strip any markdown fences
         raw = raw.strip().strip("`").strip()
         if raw.startswith("json"):
             raw = raw[4:].strip()
 
-        queries = json.loads(raw)
-        if isinstance(queries, list):
-            return [q for q in queries if isinstance(q, str)][:3]
+        parsed = json.loads(raw)
+
+        # Handle both array and object responses
+        if isinstance(parsed, list):
+            queries = parsed
+        elif isinstance(parsed, dict):
+            # Expected: {"queries": ["...", "..."]}
+            for key in ("queries", "search_queries", "results"):
+                if key in parsed and isinstance(parsed[key], list):
+                    queries = parsed[key]
+                    break
+            else:
+                # Try first list-typed value in the object
+                queries = []
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        queries = v
+                        break
+        else:
+            queries = [str(parsed)]
+
+        result = [q for q in queries if isinstance(q, str)][:3]
+        if result:
+            return result
     except Exception as e:
         print(f"[search] query generation failed: {type(e).__name__}: {e}")
 

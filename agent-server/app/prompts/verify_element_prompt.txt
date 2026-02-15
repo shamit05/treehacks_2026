@@ -1,0 +1,27 @@
+You are verifying whether a numbered box correctly covers a target UI element on a macOS screenshot.
+
+CONTEXT:
+- The user wants to: {{INSTRUCTION}}
+- The system selected Box {{ELEMENT_ID}} as the target element.
+- The selected box's label/content: "{{LABEL}}"
+
+DETECTED ELEMENTS IN THIS ZOOMED REGION:
+{{ELEMENTS_CONTEXT}}
+
+You are shown TWO images:
+1. A ZOOMED crop of the region around the selected element (with numbered YOLO boxes)
+2. The SAME crop WITHOUT boxes (so you can read the actual text underneath)
+
+YOUR TASK:
+1. Look at the zoomed crop carefully. Read the text inside and around Box {{ELEMENT_ID}}.
+2. Does Box {{ELEMENT_ID}} actually cover the element described by the instruction "{{INSTRUCTION}}"?
+3. If NOT, which box number in this zoomed view DOES cover the correct element?
+4. If no box covers it, provide a box_2d for where the element actually is.
+
+Output ONLY this JSON:
+{
+  "correct": <true if Box {{ELEMENT_ID}} is right, false if wrong>,
+  "correct_element_id": <int: the correct box ID in THIS crop, or null>,
+  "box_2d": [<ymin>, <xmin>, <ymax>, <xmax>] on 0-1000 scale relative to THIS crop,
+  "reasoning": "<explain what you see and why>"
+}

@@ -64,6 +64,9 @@ _GEMINI_PLAN_PROMPT_TEMPLATE = _GEMINI_PLAN_PROMPT_PATH.read_text()
 _GEMINI_NEXT_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "gemini_next_prompt.txt"
 _GEMINI_NEXT_PROMPT_TEMPLATE = _GEMINI_NEXT_PROMPT_PATH.read_text()
 
+_VERIFY_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "verify_element_prompt.txt"
+_VERIFY_PROMPT_TEMPLATE = _VERIFY_PROMPT_PATH.read_text()
+
 # ---------------------------------------------------------------------------
 # LLM client (lazy singleton) — supports Gemini, OpenAI, and OpenRouter
 # ---------------------------------------------------------------------------
@@ -125,25 +128,85 @@ class AgentError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction
+# JSON extraction (robust — handles fences, truncation, partial output)
 # ---------------------------------------------------------------------------
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL)
+
+
+def _repair_truncated_json(raw: str) -> str | None:
+    """
+    Attempt to repair JSON that was truncated mid-stream.
+    Tries closing open brackets, braces, and strings.
+    Returns the repaired string or None if repair isn't possible.
+    """
+    # Only attempt repair if it starts like JSON
+    s = raw.strip()
+    if not s or s[0] not in ('{', '['):
+        return None
+
+    # Track open structures
+    in_string = False
+    escape_next = False
+    opens: list[str] = []
+
+    for ch in s:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            opens.append('}')
+        elif ch == '[':
+            opens.append(']')
+        elif ch in ('}', ']'):
+            if opens and opens[-1] == ch:
+                opens.pop()
+
+    if not opens and not in_string:
+        return None  # already balanced — repair won't help
+
+    repaired = s
+    # Close open string if needed
+    if in_string:
+        repaired += '"'
+    # Remove trailing comma or colon (common in truncated JSON)
+    repaired = repaired.rstrip()
+    if repaired and repaired[-1] in (',', ':'):
+        repaired = repaired[:-1]
+    # Close open structures in reverse order
+    for closer in reversed(opens):
+        repaired += closer
+
+    return repaired
 
 
 def _extract_json(raw: str) -> dict:
     """
     Extract a JSON object from a model response that may be wrapped in
-    markdown code fences, have leading/trailing text, etc.
+    markdown code fences, have leading/trailing text, or be truncated.
+
+    Strategies (in order):
+      1. Direct parse
+      2. Code fence extraction
+      3. First { ... } block extraction
+      4. Truncated JSON repair (close open brackets/strings)
     """
     raw = raw.strip()
 
-    # Try direct parse first (best case)
+    # --- Strategy 1: Direct parse (best case) ---
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting from code fences
+    # --- Strategy 2: Code fence extraction ---
     match = _CODE_FENCE_RE.search(raw)
     if match:
         try:
@@ -151,7 +214,7 @@ def _extract_json(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Try finding the first { ... } block
+    # --- Strategy 3: First { ... } block ---
     brace_start = raw.find("{")
     brace_end = raw.rfind("}")
     if brace_start != -1 and brace_end > brace_start:
@@ -160,6 +223,28 @@ def _extract_json(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
+    # --- Strategy 4: Repair truncated JSON ---
+    # The model may have been cut off mid-response. Try to close open structures.
+    # Find the JSON start first
+    json_start = raw.find("{")
+    if json_start == -1:
+        json_start = raw.find("[")
+    if json_start != -1:
+        fragment = raw[json_start:]
+        repaired = _repair_truncated_json(fragment)
+        if repaired:
+            try:
+                result = json.loads(repaired)
+                print(f"[agent] _extract_json REPAIRED truncated JSON ({len(raw)} -> {len(repaired)} chars)")
+                if isinstance(result, dict):
+                    return result
+                # If it parsed to a list, wrap it
+                if isinstance(result, list):
+                    return {"steps": result}
+            except json.JSONDecodeError:
+                pass
+
+    print(f"[agent] _extract_json FAILED — raw content: {raw[:500]!r}")
     raise AgentError(f"Could not extract valid JSON from model response (length={len(raw)})")
 
 
@@ -170,13 +255,17 @@ def _extract_json(raw: str) -> dict:
 def _model_params(model: str, max_tokens: int) -> dict:
     """
     Return API kwargs adapted for the model.
-    Handles OpenAI o-series, OpenRouter model slugs, etc.
+    Handles OpenAI o-series, OpenRouter model slugs, Gemini, etc.
     """
     m = model.lower()
     # Models that need the new-style parameters (o-series, gpt-5)
     new_style = any(tag in m for tag in ["gpt-5", "o1", "o3", "o4"])
     if new_style:
         return {"max_completion_tokens": max_tokens, "temperature": 1}
+    # Gemini via OpenAI-compat: use max_completion_tokens (not max_tokens).
+    # The Gemini API truncates output when max_tokens is used with large inputs.
+    elif "gemini" in m:
+        return {"max_completion_tokens": max_tokens, "temperature": 0.1}
     else:
         return {"max_tokens": max_tokens, "temperature": 0.1}
 
@@ -209,11 +298,19 @@ MAX_RETRIES = 2  # retry twice (for rate limits + invalid JSON)
 _llm_semaphore = asyncio.Semaphore(1)
 
 
-async def _call_llm_with_backoff(client, model: str, messages: list, params: dict, request_id: str, label: str):
+async def _call_llm_with_backoff(
+    client, model: str, messages: list, params: dict,
+    request_id: str, label: str,
+    validate_json: bool = True,
+):
     """
     Call the LLM with rate-limit-aware retry and backoff.
     Uses a semaphore to avoid piling up concurrent requests.
     Automatically handles response_format support per model.
+
+    If validate_json=True (default), validates the response is parseable JSON.
+    On JSON failure, does a smart retry: sends the broken output back to the
+    model asking it to complete/fix the JSON, rather than re-running blind.
     """
     # Only use json_object mode for models that support it
     extra_kwargs = {}
@@ -232,6 +329,44 @@ async def _call_llm_with_backoff(client, model: str, messages: list, params: dic
                 )
                 raw_text = response.choices[0].message.content or ""
                 print(f"[agent] rid={request_id} {label} response length={len(raw_text)}")
+
+                # Validate JSON if requested
+                if validate_json and raw_text:
+                    try:
+                        _extract_json(raw_text)
+                    except AgentError:
+                        # JSON invalid — try a repair retry if we have attempts left
+                        if attempt < MAX_RETRIES:
+                            print(f"[agent] rid={request_id} {label} invalid JSON, "
+                                  f"attempting repair retry with model feedback")
+                            repair_messages = messages + [
+                                {"role": "assistant", "content": raw_text},
+                                {"role": "user", "content": (
+                                    "Your previous response was truncated or contained invalid JSON. "
+                                    "Please output the COMPLETE, valid JSON response. "
+                                    "Output ONLY the JSON, no other text."
+                                )},
+                            ]
+                            try:
+                                repair_response = await client.chat.completions.create(
+                                    model=model,
+                                    messages=repair_messages,
+                                    **params,
+                                    **extra_kwargs,
+                                )
+                                repair_text = repair_response.choices[0].message.content or ""
+                                print(f"[agent] rid={request_id} {label} repair response length={len(repair_text)}")
+                                # Validate the repair
+                                _extract_json(repair_text)
+                                return repair_text
+                            except Exception as repair_err:
+                                print(f"[agent] rid={request_id} {label} repair also failed: {repair_err}")
+                                # Fall through to normal retry
+                                await asyncio.sleep(1)
+                                continue
+                        # No retries left — return raw and let caller deal with it
+                        # (_extract_json's truncation repair may still save it)
+
                 return raw_text
             except Exception as e:
                 error_str = str(e)
@@ -954,13 +1089,20 @@ async def generate_gemini_plan(
     messages = [{"role": "user", "content": content}]
 
     raw_text = await _call_llm_with_backoff(
-        client, model, messages, _model_params(model, 2000),
+        client, model, messages, _model_params(model, 4000),
         request_id, "gemini-plan"
     )
     result = _extract_json(raw_text)
     print(f"[agent] rid={request_id} gemini-plan: {len(result.get('steps', []))} steps")
     # Log full raw response for debugging element selection
     print(f"[agent] rid={request_id} gemini-plan raw response:\n{raw_text[:3000]}")
+
+    # Attach debug metadata so callers can save prompt/response
+    result["_debug"] = {
+        "prompt": prompt,
+        "raw_response": raw_text,
+        "model": model,
+    }
     return result
 
 
@@ -995,7 +1137,7 @@ async def generate_gemini_plan_stream(
     ]
 
     model = os.getenv("OPENAI_MODEL", "gemini-3-pro-preview")
-    params = _model_params(model, 2000)
+    params = _model_params(model, 4000)
 
     extra_kwargs = {}
     if _supports_json_mode(model):
@@ -1095,13 +1237,20 @@ async def generate_gemini_next(
     messages = [{"role": "user", "content": content}]
 
     raw_text = await _call_llm_with_backoff(
-        client, model, messages, _model_params(model, 2000),
+        client, model, messages, _model_params(model, 4000),
         request_id, "gemini-next"
     )
     result = _extract_json(raw_text)
     print(f"[agent] rid={request_id} gemini-next: status={result.get('status')} steps={len(result.get('steps', []))}")
     # Log full raw response for debugging element selection
     print(f"[agent] rid={request_id} gemini-next raw response:\n{raw_text[:3000]}")
+
+    # Attach debug metadata
+    result["_debug"] = {
+        "prompt": prompt,
+        "raw_response": raw_text,
+        "model": model,
+    }
     return result
 
 
@@ -1214,7 +1363,7 @@ async def generate_gemini_plan_with_files_stream(
             contents,
             generation_config=genai.GenerationConfig(
                 response_mime_type="application/json",
-                max_output_tokens=2000,
+                max_output_tokens=4000,
                 temperature=0.1,
             ),
             stream=True,
@@ -1250,7 +1399,7 @@ async def generate_gemini_plan_with_files_stream(
                 contents,
                 generation_config=genai.GenerationConfig(
                     response_mime_type="application/json",
-                    max_output_tokens=2000,
+                    max_output_tokens=4000,
                     temperature=0.1,
                 ),
             )
@@ -1261,3 +1410,64 @@ async def generate_gemini_plan_with_files_stream(
         except Exception as retry_err:
             print(f"[agent] rid={request_id} retry also failed: {retry_err}")
             raise parse_err
+
+
+# ---------------------------------------------------------------------------
+# Element verification: crop + re-ask to confirm correct element
+# ---------------------------------------------------------------------------
+
+
+async def verify_element(
+    instruction: str,
+    element_id: int,
+    label: str,
+    annotated_crop_bytes: bytes,
+    raw_crop_bytes: bytes,
+    elements_context: str,
+    request_id: str = "",
+) -> dict:
+    """
+    Verify that a specific numbered box actually covers the correct UI element.
+    Sends a zoomed crop (both annotated and raw) so the LLM can read text underneath.
+
+    Returns dict with:
+      - correct: bool
+      - correct_element_id: int | None (the right element in the crop)
+      - box_2d: [ymin, xmin, ymax, xmax] on 0-1000 scale relative to the crop
+      - reasoning: str
+    """
+    client = _get_client()
+
+    prompt = _VERIFY_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{INSTRUCTION}}", instruction)
+    prompt = prompt.replace("{{ELEMENT_ID}}", str(element_id))
+    prompt = prompt.replace("{{LABEL}}", label or "")
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context)
+
+    annotated_b64 = base64.b64encode(annotated_crop_bytes).decode("utf-8")
+    raw_b64 = base64.b64encode(raw_crop_bytes).decode("utf-8")
+
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated_b64}", "detail": "high"}},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}},
+    ]
+
+    model = os.getenv("OPENAI_MODEL", "gemini-2.5-flash")
+    messages = [{"role": "user", "content": content}]
+
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 500),
+        request_id, "verify-element"
+    )
+    result = _extract_json(raw_text)
+    print(f"[agent] rid={request_id} verify: correct={result.get('correct')} "
+          f"correct_id={result.get('correct_element_id')} reasoning={result.get('reasoning', '')[:100]}")
+
+    # Attach debug metadata
+    result["_debug"] = {
+        "prompt": prompt,
+        "raw_response": raw_text,
+        "model": model,
+    }
+    return result

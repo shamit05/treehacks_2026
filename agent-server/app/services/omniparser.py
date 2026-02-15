@@ -538,20 +538,90 @@ def snap_to_nearest_element(
 # ---------------------------------------------------------------------------
 
 
-def format_elements_context(elements: list[OmniElement]) -> str:
+def format_elements_context(elements: list[OmniElement], max_elements: int = 120) -> str:
     """
     Format OmniParser elements into a text context string for the LLM prompt.
-    Each element is listed with its ID, type, content, and bbox.
+    Each element is listed with its ID, type, content, bbox, and nearby neighbors.
     The ID matches the numbered box drawn on the annotated screenshot.
+
+    Neighbor info helps the LLM cross-reference: "Box 12 is right of Box 11
+    and below Box 5" lets it verify it's looking at the right box.
+
+    Caps at max_elements to keep the prompt within reasonable token limits.
+    Elements are drawn on the image regardless, so the LLM can still see them.
     """
     if not elements:
         return "(no elements detected)"
 
-    lines = []
+    # If there are too many elements, keep them all but add a note
+    display_elements = elements
+    truncated = False
+    if len(elements) > max_elements:
+        display_elements = elements[:max_elements]
+        truncated = True
+
+    # Pre-compute centers for neighbor lookup (use ALL elements for neighbor calculation)
+    centers = {}
     for e in elements:
         x, y, w, h = e.bbox_xywh
+        centers[e.id] = (x + w / 2, y + h / 2)
+
+    lines = []
+    for e in display_elements:
+        x, y, w, h = e.bbox_xywh
+        cx, cy = centers[e.id]
+
+        # Find closest neighbors in each direction (for disambiguation)
+        neighbors = []
+        best_left = (None, float("inf"))
+        best_right = (None, float("inf"))
+        best_above = (None, float("inf"))
+        best_below = (None, float("inf"))
+
+        for other in elements:
+            if other.id == e.id:
+                continue
+            ocx, ocy = centers[other.id]
+            dx = ocx - cx
+            dy = ocy - cy
+            dist = (dx ** 2 + dy ** 2) ** 0.5
+
+            # Must be relatively close (within 15% of screen) to be a useful neighbor
+            if dist > 0.15:
+                continue
+
+            # Classify direction (must be clearly in one direction)
+            if dx < -0.02 and abs(dy) < abs(dx) * 0.8:
+                if dist < best_left[1]:
+                    best_left = (other.id, dist)
+            elif dx > 0.02 and abs(dy) < abs(dx) * 0.8:
+                if dist < best_right[1]:
+                    best_right = (other.id, dist)
+            elif dy < -0.02 and abs(dx) < abs(dy) * 0.8:
+                if dist < best_above[1]:
+                    best_above = (other.id, dist)
+            elif dy > 0.02 and abs(dx) < abs(dy) * 0.8:
+                if dist < best_below[1]:
+                    best_below = (other.id, dist)
+
+        neighbor_parts = []
+        if best_left[0] is not None:
+            neighbor_parts.append(f"left=Box{best_left[0]}")
+        if best_right[0] is not None:
+            neighbor_parts.append(f"right=Box{best_right[0]}")
+        if best_above[0] is not None:
+            neighbor_parts.append(f"above=Box{best_above[0]}")
+        if best_below[0] is not None:
+            neighbor_parts.append(f"below=Box{best_below[0]}")
+        neighbor_str = f" neighbors({', '.join(neighbor_parts)})" if neighbor_parts else ""
+
         lines.append(
             f"  [Box {e.id}] \"{e.content}\" "
-            f"— bbox(x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f})"
+            f"— bbox(x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}){neighbor_str}"
         )
+
+    if truncated:
+        lines.append(f"\n  (Showing {max_elements} of {len(elements)} detected elements. "
+                      f"All {len(elements)} are numbered in the screenshot image.)")
+
     return "\n".join(lines)
