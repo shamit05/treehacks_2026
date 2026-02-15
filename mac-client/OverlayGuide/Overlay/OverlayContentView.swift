@@ -118,16 +118,6 @@ struct OverlayContentView: View {
                     .buttonStyle(.plain)
                     .foregroundColor(voiceInput.isListening ? .red : .secondary)
                     .help(voiceInput.isListening ? "Stop voice input" : "Start voice input")
-
-                    Button(action: {
-                        NotificationCenter.default.post(name: .openCookbookPreferences, object: nil)
-                    }) {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.secondary.opacity(0.6))
-                    .help("Learning preferences (Cmd+Option+,)")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 11)

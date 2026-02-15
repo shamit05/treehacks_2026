@@ -1178,119 +1178,189 @@ async def create_plan(
         else:
             print(f"[plan] rid={request_id} search skipped (skip_search=true)")
 
-        # ===== STEP 1: Save original screenshot =====
         dbg.save_image("original_screenshot", screenshot_bytes,
                        f"{parsed_size.w}x{parsed_size.h}")
 
-        # ===== STEP 2: YOLO on full screenshot =====
-        elements = detect_elements(screenshot_bytes)
-        print(f"[plan] rid={request_id} YOLO detected {len(elements)} elements on full screenshot")
-
-        # Sort by position (top-to-bottom, left-to-right) and renumber
-        elements.sort(key=lambda e: (e.bbox_xyxy[1], e.bbox_xyxy[0]))
-        for i, e in enumerate(elements):
-            e.id = i
-
-        # ===== STEP 3: Draw numbered boxes on screenshot =====
-        annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
-        dbg.save_image("yolo_annotated", annotated_bytes,
-                       f"{len(elements)} elements")
-
-        elements_ctx = format_elements_context(elements)
-        dbg.save_text("yolo_elements", elements_ctx,
-                      f"{len(elements)} elements")
-
-        # ===== STEP 3.5: Collect search results if available =====
+        # ===== PASS 1: Spatial localization on RAW screenshot =====
+        # No boxes drawn — Gemini sees a clean image and returns box_2d regions.
         search_context = ""
         if search_task is not None:
             search_context = await search_task
             if search_context:
                 print(f"[plan] rid={request_id} search returned {len(search_context)} chars of context")
                 dbg.save_text("search_context", search_context)
-            else:
-                dbg.save_text("search_context", "(no results or search disabled)")
 
-        # ===== STEP 4: Single Gemini call — one-shot plan =====
-        from app.services.agent import generate_gemini_plan
-        result = await generate_gemini_plan(
+        from app.services.agent import generate_locate_steps, generate_identify_element
+        locate_result = await generate_locate_steps(
             goal=goal,
-            annotated_screenshot_bytes=annotated_bytes,
             raw_screenshot_bytes=screenshot_bytes,
-            elements_context=elements_ctx,
             request_id=request_id,
             search_context=search_context,
         )
 
-        # Save prompt + raw response from Gemini
-        debug_meta = result.pop("_debug", {})
-        if debug_meta:
+        # Save Pass 1 debug
+        locate_debug = locate_result.pop("_debug", {})
+        if locate_debug:
             dbg.save_prompt_and_response(
-                "gemini_plan",
-                prompt=debug_meta.get("prompt", ""),
-                response=debug_meta.get("raw_response", ""),
-                model=debug_meta.get("model", ""),
+                "pass1_locate",
+                prompt=locate_debug.get("prompt", ""),
+                response=locate_debug.get("raw_response", ""),
+                model=locate_debug.get("model", ""),
             )
+        dbg.save_json("pass1_locate_output", locate_result)
 
-        # Save the parsed Gemini output
-        dbg.save_json("gemini_parsed_output", result)
+        raw_steps = locate_result.get("steps", [])
+        print(f"[plan] rid={request_id} Pass 1 returned {len(raw_steps)} spatial steps")
 
-        # ===== STEP 5: Convert Gemini response → StepPlan with YOLO snapping =====
+        # ===== PASS 2: For each step, crop → YOLO → identify exact element =====
         converted_steps: list[Step] = []
+        img = Image.open(io.BytesIO(screenshot_bytes))
+        actual_w, actual_h = img.size
 
-        for step_data in result.get("steps", []):
+        for step_data in raw_steps:
             step_id = step_data.get("id", f"s{len(converted_steps) + 1}")
             instruction = step_data.get("instruction", "")
-            label = step_data.get("label")
+            label = step_data.get("label", "")
             confidence = step_data.get("confidence", 0.5)
             advance_type = step_data.get("advance", "click_in_target")
-            reasoning = step_data.get("reasoning", "")
+            box_2d = step_data.get("box_2d", [])
 
-            # Log Gemini's reasoning for debugging element selection
-            if reasoning:
-                print(f"[plan] rid={request_id} step={step_id} REASONING: {reasoning}")
-            print(f"[plan] rid={request_id} step={step_id} element_id={step_data.get('element_id')} box_2d={step_data.get('box_2d')} label={label!r}")
+            print(f"[plan] rid={request_id} step={step_id} Pass 1 box_2d={box_2d} label={label!r}")
 
-            rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "plan")
+            # Parse box_2d from Pass 1 (0-1000 scale)
+            if not box_2d or len(box_2d) != 4:
+                print(f"[plan] rid={request_id} step={step_id} invalid box_2d, using center fallback")
+                rx, ry, rw, rh = 0.4, 0.4, 0.2, 0.2
+                converted_steps.append(Step(
+                    id=step_id, instruction=instruction,
+                    targets=[TargetRect(type=TargetType.bbox_norm, x=rx, y=ry, w=rw, h=rh,
+                                        confidence=0.1, label=label)],
+                    advance=Advance(type=_ADVANCE_MAP.get(advance_type, AdvanceType.click_in_target)),
+                ))
+                continue
 
-            # ===== STEP 5.5: Iterative verification for important steps =====
-            step_idx = len(converted_steps)
-            needs_verify = (
-                step_idx == 0
-                or confidence < _VERIFY_CONFIDENCE_THRESHOLD
-            )
-            verification_result = None
-            if needs_verify:
-                print(f"[plan] rid={request_id} step={step_id} running verification pass "
-                      f"(idx={step_idx}, conf={confidence})")
-                try:
-                    vx, vy, vw, vh = await _verify_and_correct_step(
-                        step_data=step_data,
-                        resolved_x=rx,
-                        resolved_y=ry,
-                        resolved_w=rw,
-                        resolved_h=rh,
-                        original_screenshot_bytes=screenshot_bytes,
-                        elements=elements,
-                        request_id=request_id,
+            ymin, xmin, ymax, xmax = box_2d
+            loc_x = xmin / 1000.0
+            loc_y = ymin / 1000.0
+            loc_w = (xmax - xmin) / 1000.0
+            loc_h = (ymax - ymin) / 1000.0
+
+            # Crop a generous region around the Pass 1 box_2d
+            pad = 0.06  # 6% padding on each side
+            crop_x = max(0.0, loc_x - pad)
+            crop_y = max(0.0, loc_y - pad)
+            crop_w = min(loc_w + pad * 2, 1.0 - crop_x)
+            crop_h = min(loc_h + pad * 2, 1.0 - crop_y)
+
+            # Ensure minimum crop size so YOLO has context
+            min_crop = 0.10
+            if crop_w < min_crop:
+                center = loc_x + loc_w / 2
+                crop_x = max(0.0, center - min_crop / 2)
+                crop_w = min(min_crop, 1.0 - crop_x)
+            if crop_h < min_crop:
+                center = loc_y + loc_h / 2
+                crop_y = max(0.0, center - min_crop / 2)
+                crop_h = min(min_crop, 1.0 - crop_y)
+
+            # Pixel crop
+            left = int(crop_x * actual_w)
+            top = int(crop_y * actual_h)
+            right = int((crop_x + crop_w) * actual_w)
+            bottom = int((crop_y + crop_h) * actual_h)
+            cropped = img.crop((left, top, right, bottom)).convert("RGB")
+            crop_buf = io.BytesIO()
+            cropped.save(crop_buf, format="PNG")
+            raw_crop_bytes = crop_buf.getvalue()
+
+            print(f"[plan] rid={request_id} step={step_id} crop=({crop_x:.3f},{crop_y:.3f},{crop_w:.3f},{crop_h:.3f}) "
+                  f"pixels=({right-left}x{bottom-top})")
+
+            # Run YOLO on the crop — catches all elements at high resolution
+            crop_elements = detect_elements(raw_crop_bytes)
+            crop_elements.sort(key=lambda e: (e.bbox_xyxy[1], e.bbox_xyxy[0]))
+            for i, e in enumerate(crop_elements):
+                e.id = i
+
+            print(f"[plan] rid={request_id} step={step_id} YOLO on crop: {len(crop_elements)} elements")
+
+            if not crop_elements:
+                # No elements found — use Pass 1 raw coordinates
+                print(f"[plan] rid={request_id} step={step_id} no YOLO elements in crop, using Pass 1 coords")
+                rx, ry, rw, rh = loc_x, loc_y, loc_w, loc_h
+            else:
+                # Draw numbered boxes on the crop
+                annotated_crop = draw_numbered_boxes(raw_crop_bytes, crop_elements)
+                crop_ctx = format_elements_context(crop_elements)
+
+                # Save crop debug images
+                dbg.save_image(f"pass2_{step_id}_crop_raw", raw_crop_bytes)
+                dbg.save_image(f"pass2_{step_id}_crop_annotated", annotated_crop,
+                               f"{len(crop_elements)} elements")
+                dbg.save_text(f"pass2_{step_id}_elements", crop_ctx)
+
+                # Ask Gemini to pick the exact element on the zoomed crop
+                identify_result = await generate_identify_element(
+                    instruction=instruction,
+                    label=label,
+                    annotated_crop_bytes=annotated_crop,
+                    raw_crop_bytes=raw_crop_bytes,
+                    elements_context=crop_ctx,
+                    request_id=request_id,
+                )
+
+                # Save Pass 2 debug
+                id_debug = identify_result.pop("_debug", {})
+                if id_debug:
+                    dbg.save_prompt_and_response(
+                        f"pass2_{step_id}_identify",
+                        prompt=id_debug.get("prompt", ""),
+                        response=id_debug.get("raw_response", ""),
+                        model=id_debug.get("model", ""),
                     )
-                    if (vx, vy, vw, vh) != (rx, ry, rw, rh):
-                        print(f"[plan] rid={request_id} step={step_id} VERIFICATION CORRECTED: "
-                              f"({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f}) -> ({vx:.3f},{vy:.3f},{vw:.3f},{vh:.3f})")
-                        verification_result = {"corrected": True, "before": (rx,ry,rw,rh), "after": (vx,vy,vw,vh)}
-                        rx, ry, rw, rh = vx, vy, vw, vh
-                    else:
-                        print(f"[plan] rid={request_id} step={step_id} VERIFICATION CONFIRMED original bbox")
-                        verification_result = {"corrected": False}
-                except Exception as ve:
-                    print(f"[plan] rid={request_id} step={step_id} verification failed (non-fatal): {ve}")
-                    verification_result = {"error": str(ve)}
+
+                picked_id = identify_result.get("element_id")
+                crop_elem_map = {e.id: e for e in crop_elements}
+
+                if picked_id is not None and picked_id in crop_elem_map:
+                    # Map crop-relative bbox back to full-screen coordinates
+                    ce = crop_elem_map[picked_id]
+                    ce_x, ce_y, ce_w, ce_h = ce.bbox_xywh
+                    rx = crop_x + ce_x * crop_w
+                    ry = crop_y + ce_y * crop_h
+                    rw = ce_w * crop_w
+                    rh = ce_h * crop_h
+                    confidence = identify_result.get("confidence", confidence)
+                    print(f"[plan] rid={request_id} step={step_id} Pass 2 picked elem[{picked_id}] "
+                          f"-> full ({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f}) "
+                          f"reasoning: {identify_result.get('reasoning', '')[:80]}")
+                else:
+                    # Fallback: snap Pass 1 box_2d to nearest YOLO crop element
+                    rel_x = (loc_x - crop_x) / crop_w
+                    rel_y = (loc_y - crop_y) / crop_h
+                    rel_w = loc_w / crop_w
+                    rel_h = loc_h / crop_h
+                    snap_x, snap_y, snap_w, snap_h, snap_id = snap_to_nearest_element(
+                        rel_x, rel_y, rel_w, rel_h, crop_elements
+                    )
+                    rx = crop_x + snap_x * crop_w
+                    ry = crop_y + snap_y * crop_h
+                    rw = snap_w * crop_w
+                    rh = snap_h * crop_h
+                    print(f"[plan] rid={request_id} step={step_id} Pass 2 no valid pick, "
+                          f"snapped to elem[{snap_id}] -> full ({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f})")
+
+            # Clamp
+            rx = max(0.0, min(rx, 1.0))
+            ry = max(0.0, min(ry, 1.0))
+            rw = max(0.02, min(rw, 1.0 - rx))
+            rh = max(0.02, min(rh, 1.0 - ry))
 
             # Save per-step resolution trace
             dbg.save_step_resolution(
                 step_id=step_id,
                 step_data=step_data,
                 resolved_bbox=(rx, ry, rw, rh),
-                verification_result=verification_result,
             )
 
             converted_steps.append(Step(

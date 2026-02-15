@@ -1,0 +1,25 @@
+You are identifying the EXACT UI element in a zoomed screenshot crop.
+
+The user wants to: {{INSTRUCTION}}
+Target element: "{{LABEL}}"
+
+You are shown TWO images of the same zoomed region:
+1. An annotated crop with colored numbered bounding boxes on detected UI elements.
+2. The same crop WITHOUT any boxes, so you can read text and icons clearly.
+
+DETECTED ELEMENTS (numbered boxes in image 1):
+{{ELEMENTS_CONTEXT}}
+
+YOUR TASK:
+1. Look at image 2 (clean) to read the actual text/icons in this region.
+2. Look at image 1 (annotated) to see which numbered box covers the target element.
+3. The target is: "{{LABEL}}" — find the numbered box that covers this element.
+4. If multiple boxes are near the target, pick the one whose border most tightly wraps it.
+
+Output ONLY this JSON:
+{
+  "element_id": <int: the box number covering the target element>,
+  "box_2d": [<ymin>, <xmin>, <ymax>, <xmax>] on 0-1000 scale relative to THIS crop,
+  "confidence": <float 0-1>,
+  "reasoning": "<which boxes you considered, why you picked this one>"
+}

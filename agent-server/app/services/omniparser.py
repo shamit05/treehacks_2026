@@ -119,17 +119,12 @@ def _get_yolo_model():
 
 
 # ---------------------------------------------------------------------------
-# Element quality filtering
+# Light dedup only — no aggressive filtering
 # ---------------------------------------------------------------------------
-# These thresholds control the quality/quantity tradeoff for detected elements.
-# Fewer high-quality elements = cleaner annotated image = LLM picks the right box.
-# Lots of noisy elements = cluttered image = LLM misreads box numbers.
-
-_MIN_CONFIDENCE = 0.15       # Ignore elements below this YOLO confidence
-_MIN_AREA = 0.0003           # Ignore elements smaller than ~0.03% of screen (tiny dots)
-_MAX_AREA = 0.25             # Ignore elements larger than 25% of screen (full panels)
-_MAX_ELEMENTS = 80           # Hard cap — keep the N highest-confidence elements
-_DEDUP_IOU_THRESHOLD = 0.6   # Merge near-duplicate boxes (high overlap)
+# The two-pass zoom pipeline means the LLM never sees all boxes at once.
+# Pass 1 sees the RAW screenshot (no boxes). Pass 2 sees a zoomed crop
+# with only the local elements. So we keep ALL elements here.
+_DEDUP_IOU_THRESHOLD = 0.85  # Only remove true duplicates (near-identical boxes)
 
 
 def _compute_iou(a: list[float], b: list[float]) -> float:
@@ -149,8 +144,7 @@ def _compute_iou(a: list[float], b: list[float]) -> float:
 
 def _deduplicate_boxes(elements: list[tuple[float, list[float]]]) -> list[tuple[float, list[float]]]:
     """
-    Remove near-duplicate boxes. Keep the higher-confidence one
-    when two boxes overlap significantly (IoU > threshold).
+    Remove true duplicate boxes (IoU > 0.85). Keep higher-confidence one.
     Elements should be sorted by confidence (highest first).
     """
     kept: list[tuple[float, list[float]]] = []
@@ -172,21 +166,18 @@ def detect_elements(
 ) -> list[OmniElement]:
     """
     Run OmniParser YOLO v2 model on a screenshot.
-    Returns detected elements with normalized bboxes, filtered for quality:
-      1. Confidence >= _MIN_CONFIDENCE
-      2. Area within [_MIN_AREA, _MAX_AREA]
-      3. Deduplicated (high-IoU merging)
-      4. Capped at _MAX_ELEMENTS (highest confidence kept)
+    Returns ALL detected elements with normalized bboxes.
+    Only removes true duplicates (IoU > 0.85). No confidence caps,
+    no area filters, no element count limits — the two-pass zoom
+    pipeline handles readability by showing boxes only on zoomed crops.
     """
     model = _get_yolo_model()
 
-    # Save to temp file (YOLO expects a path or array)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp.write(screenshot_bytes)
         tmp_path = tmp.name
 
     try:
-        # Use 1024px for better detection of small UI elements on Retina displays.
         results = model.predict(
             source=tmp_path,
             conf=box_threshold,
@@ -208,27 +199,10 @@ def detect_elements(
         # Sort by confidence (highest first)
         raw_elements.sort(key=lambda x: x[0], reverse=True)
 
-        # --- Filter 1: confidence ---
-        raw_elements = [(c, b) for c, b in raw_elements if c >= _MIN_CONFIDENCE]
-
-        # --- Filter 2: area (remove tiny dots and huge panels) ---
-        filtered = []
-        for conf, bbox in raw_elements:
-            w_norm = bbox[2] - bbox[0]
-            h_norm = bbox[3] - bbox[1]
-            area = w_norm * h_norm
-            if _MIN_AREA <= area <= _MAX_AREA:
-                filtered.append((conf, bbox))
-        raw_elements = filtered
-
-        # --- Filter 3: deduplicate overlapping boxes ---
+        # Only remove true duplicates — keep everything else
         raw_elements = _deduplicate_boxes(raw_elements)
 
-        # --- Filter 4: cap count ---
-        raw_elements = raw_elements[:_MAX_ELEMENTS]
-
-        print(f"[omniparser] filtered: {raw_count} raw -> {len(raw_elements)} elements "
-              f"(conf>={_MIN_CONFIDENCE}, area in [{_MIN_AREA},{_MAX_AREA}], dedup, cap={_MAX_ELEMENTS})")
+        print(f"[omniparser] {raw_count} raw -> {len(raw_elements)} elements (dedup only)")
 
         elements: list[OmniElement] = []
         for i, (conf, bbox) in enumerate(raw_elements):

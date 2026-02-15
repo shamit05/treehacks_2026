@@ -16,6 +16,7 @@ struct OnboardingView: View {
     @State private var detectedApps: [(name: String, version: String)] = []
     @State private var showApps = false
     @FocusState private var isTextFieldFocused: Bool
+    @State private var showingOnboardingFlow = false
 
     // Permission states (polled on appear + timer)
     @State private var hasAccessibility = false
@@ -31,12 +32,13 @@ struct OnboardingView: View {
 
     var body: some View {
         Group {
-            if settingsMode {
+            if settingsMode && !showingOnboardingFlow {
                 settingsPage
             } else {
                 onboardingFlow
             }
         }
+        .animation(.easeInOut(duration: 0.3), value: showingOnboardingFlow)
         .onAppear {
             learningStyleText = preferences.learningStyle
             refreshPermissions()
@@ -269,16 +271,35 @@ struct OnboardingView: View {
                     }
                 }
 
-                // Hotkey reminder
-                HStack(spacing: 6) {
-                    Image(systemName: "keyboard")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                    Text("Cmd+Option+O overlay  ·  Cmd+Option+, settings  ·  Esc dismiss")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary.opacity(0.7))
+                Divider()
+
+                // Bottom row: redo onboarding + hotkey reminder
+                HStack {
+                    Button(action: {
+                        currentPage = .welcome
+                        showingOnboardingFlow = true
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 11))
+                            Text("Redo Onboarding")
+                                .font(.system(size: 12))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "keyboard")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        Text("Cmd+Opt+O overlay · Cmd+Opt+, settings")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary.opacity(0.7))
+                    }
                 }
-                .padding(.top, 4)
             }
             .padding(24)
         }

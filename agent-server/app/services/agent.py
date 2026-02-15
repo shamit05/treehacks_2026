@@ -67,6 +67,16 @@ _GEMINI_NEXT_PROMPT_TEMPLATE = _GEMINI_NEXT_PROMPT_PATH.read_text()
 _VERIFY_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "verify_element_prompt.txt"
 _VERIFY_PROMPT_TEMPLATE = _VERIFY_PROMPT_PATH.read_text()
 
+# Two-pass zoom pipeline prompts
+_LOCATE_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "gemini_locate_prompt.txt"
+_LOCATE_PROMPT_TEMPLATE = _LOCATE_PROMPT_PATH.read_text()
+
+_LOCATE_NEXT_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "gemini_locate_next_prompt.txt"
+_LOCATE_NEXT_PROMPT_TEMPLATE = _LOCATE_NEXT_PROMPT_PATH.read_text()
+
+_IDENTIFY_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "gemini_identify_prompt.txt"
+_IDENTIFY_PROMPT_TEMPLATE = _IDENTIFY_PROMPT_PATH.read_text()
+
 # ---------------------------------------------------------------------------
 # LLM client (lazy singleton) — supports Gemini, OpenAI, and OpenRouter
 # ---------------------------------------------------------------------------
@@ -1465,6 +1475,163 @@ async def verify_element(
           f"correct_id={result.get('correct_element_id')} reasoning={result.get('reasoning', '')[:100]}")
 
     # Attach debug metadata
+    result["_debug"] = {
+        "prompt": prompt,
+        "raw_response": raw_text,
+        "model": model,
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Two-pass zoom pipeline: Pass 1 — spatial localization on raw screenshot
+# ---------------------------------------------------------------------------
+
+
+async def generate_locate_steps(
+    goal: str,
+    raw_screenshot_bytes: bytes,
+    request_id: str = "",
+    search_context: str = "",
+) -> dict:
+    """
+    Pass 1 of the two-pass zoom pipeline.
+    Sends the RAW screenshot (no boxes, no annotations) to Gemini
+    and asks it to spatially locate the target elements with box_2d.
+
+    Gemini is excellent at spatial reasoning on clean images — it just
+    can't read tiny overlapping box numbers. So we don't show boxes here.
+
+    Returns dict with "steps" list, each containing box_2d, instruction, etc.
+    """
+    client = _get_client()
+
+    prompt = _LOCATE_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
+
+    raw_b64 = base64.b64encode(raw_screenshot_bytes).decode("utf-8")
+
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}},
+    ]
+
+    model = os.getenv("OPENAI_MODEL", "gemini-3-flash-preview")
+    messages = [{"role": "user", "content": content}]
+
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 4000),
+        request_id, "locate-steps"
+    )
+    result = _extract_json(raw_text)
+    print(f"[agent] rid={request_id} locate-steps: {len(result.get('steps', []))} steps")
+
+    result["_debug"] = {
+        "prompt": prompt,
+        "raw_response": raw_text,
+        "model": model,
+    }
+    return result
+
+
+async def generate_locate_next(
+    goal: str,
+    raw_screenshot_bytes: bytes,
+    completed_steps_summary: str,
+    num_completed: int,
+    total_steps: int,
+    request_id: str = "",
+    search_context: str = "",
+) -> dict:
+    """
+    Pass 1 for /next endpoint. Same as generate_locate_steps but includes
+    completed step history and returns status (done/continue/retry).
+    """
+    client = _get_client()
+
+    prompt = _LOCATE_NEXT_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
+    prompt = prompt.replace("{{NUM_COMPLETED}}", str(num_completed))
+    prompt = prompt.replace("{{TOTAL_STEPS}}", str(total_steps))
+    prompt = prompt.replace("{{COMPLETED_STEPS}}", completed_steps_summary or "none yet")
+
+    raw_b64 = base64.b64encode(raw_screenshot_bytes).decode("utf-8")
+
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}},
+    ]
+
+    model = os.getenv("OPENAI_MODEL", "gemini-3-flash-preview")
+    messages = [{"role": "user", "content": content}]
+
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 4000),
+        request_id, "locate-next"
+    )
+    result = _extract_json(raw_text)
+    print(f"[agent] rid={request_id} locate-next: status={result.get('status')} steps={len(result.get('steps', []))}")
+
+    result["_debug"] = {
+        "prompt": prompt,
+        "raw_response": raw_text,
+        "model": model,
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Two-pass zoom pipeline: Pass 2 — precise element identification on crop
+# ---------------------------------------------------------------------------
+
+
+async def generate_identify_element(
+    instruction: str,
+    label: str,
+    annotated_crop_bytes: bytes,
+    raw_crop_bytes: bytes,
+    elements_context: str,
+    request_id: str = "",
+) -> dict:
+    """
+    Pass 2 of the two-pass zoom pipeline.
+    Sends a ZOOMED crop (with numbered boxes) + the raw crop (for reading text)
+    and asks Gemini to pick the exact element_id.
+
+    Because the crop is zoomed in, there are typically only 10-30 boxes,
+    all with large, readable labels.
+
+    Returns dict with element_id, box_2d (crop-relative), confidence, reasoning.
+    """
+    client = _get_client()
+
+    prompt = _IDENTIFY_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{INSTRUCTION}}", instruction)
+    prompt = prompt.replace("{{LABEL}}", label or "")
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context)
+
+    annotated_b64 = base64.b64encode(annotated_crop_bytes).decode("utf-8")
+    raw_b64 = base64.b64encode(raw_crop_bytes).decode("utf-8")
+
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated_b64}", "detail": "high"}},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_b64}", "detail": "high"}},
+    ]
+
+    model = os.getenv("OPENAI_MODEL", "gemini-3-flash-preview")
+    messages = [{"role": "user", "content": content}]
+
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 2000),
+        request_id, "identify-element"
+    )
+    result = _extract_json(raw_text)
+    print(f"[agent] rid={request_id} identify-element: elem_id={result.get('element_id')} "
+          f"conf={result.get('confidence')} reasoning={result.get('reasoning', '')[:80]}")
+
     result["_debug"] = {
         "prompt": prompt,
         "raw_response": raw_text,
