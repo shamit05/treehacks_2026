@@ -926,6 +926,7 @@ async def generate_gemini_plan(
     raw_screenshot_bytes: bytes,
     elements_context: str,
     request_id: str = "",
+    search_context: str = "",
 ) -> dict:
     """
     One-shot plan generation optimized for Gemini's native vision + GUI grounding.
@@ -937,6 +938,7 @@ async def generate_gemini_plan(
     prompt = _GEMINI_PLAN_PROMPT_TEMPLATE
     prompt = prompt.replace("{{GOAL}}", goal)
     prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context or "(no elements detected)")
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
 
     # Send annotated screenshot (numbered boxes) + raw screenshot (readable text)
     annotated_b64 = base64.b64encode(annotated_screenshot_bytes).decode("utf-8")
@@ -957,6 +959,8 @@ async def generate_gemini_plan(
     )
     result = _extract_json(raw_text)
     print(f"[agent] rid={request_id} gemini-plan: {len(result.get('steps', []))} steps")
+    # Log full raw response for debugging element selection
+    print(f"[agent] rid={request_id} gemini-plan raw response:\n{raw_text[:3000]}")
     return result
 
 
@@ -966,6 +970,7 @@ async def generate_gemini_plan_stream(
     raw_screenshot_bytes: bytes,
     elements_context: str,
     request_id: str = "",
+    search_context: str = "",
 ):
     """
     Streaming version of generate_gemini_plan.
@@ -978,6 +983,7 @@ async def generate_gemini_plan_stream(
     prompt = _GEMINI_PLAN_PROMPT_TEMPLATE
     prompt = prompt.replace("{{GOAL}}", goal)
     prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context or "(no elements detected)")
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
 
     annotated_b64 = base64.b64encode(annotated_screenshot_bytes).decode("utf-8")
     raw_b64 = base64.b64encode(raw_screenshot_bytes).decode("utf-8")
@@ -1037,6 +1043,7 @@ async def generate_gemini_plan_stream(
                 raw_screenshot_bytes=raw_screenshot_bytes,
                 elements_context=elements_context,
                 request_id=request_id + "-retry",
+                search_context=search_context,
             )
             # generate_gemini_plan returns a dict (already parsed)
             yield {"type": "plan", "data": result}
@@ -1059,6 +1066,7 @@ async def generate_gemini_next(
     num_completed: int,
     total_steps: int,
     request_id: str = "",
+    search_context: str = "",
 ) -> dict:
     """
     Given a fresh screenshot after the user completed a step, ask Gemini
@@ -1068,6 +1076,7 @@ async def generate_gemini_next(
 
     prompt = _GEMINI_NEXT_PROMPT_TEMPLATE
     prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
     prompt = prompt.replace("{{NUM_COMPLETED}}", str(num_completed))
     prompt = prompt.replace("{{TOTAL_STEPS}}", str(total_steps))
     prompt = prompt.replace("{{COMPLETED_STEPS}}", completed_steps_summary or "none yet")
@@ -1091,6 +1100,8 @@ async def generate_gemini_next(
     )
     result = _extract_json(raw_text)
     print(f"[agent] rid={request_id} gemini-next: status={result.get('status')} steps={len(result.get('steps', []))}")
+    # Log full raw response for debugging element selection
+    print(f"[agent] rid={request_id} gemini-next raw response:\n{raw_text[:3000]}")
     return result
 
 
@@ -1173,6 +1184,7 @@ async def generate_gemini_plan_with_files_stream(
     raw_file,
     elements_context: str,
     request_id: str = "",
+    search_context: str = "",
 ):
     """
     Streaming plan generation using pre-uploaded Gemini files.
@@ -1185,6 +1197,7 @@ async def generate_gemini_plan_with_files_stream(
     prompt = _GEMINI_PLAN_PROMPT_TEMPLATE
     prompt = prompt.replace("{{GOAL}}", goal)
     prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context or "(no elements detected)")
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
 
     model_name = os.getenv("OPENAI_MODEL", "gemini-3-flash-preview")
     model = genai.GenerativeModel(model_name)

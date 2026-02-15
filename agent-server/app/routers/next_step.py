@@ -22,6 +22,7 @@ from app.schemas.step_plan import (
 from app.services.agent import AgentError, generate_gemini_next
 from app.services.mock import get_mock_next_step
 from app.services.omniparser import detect_elements, draw_numbered_boxes, format_elements_context, snap_to_nearest_element
+from app.services.search import get_stored_search_context
 from app.routers.plan import _resolve_bbox, _ADVANCE_MAP
 
 router = APIRouter()
@@ -83,6 +84,11 @@ async def next_step(
             steps_summary_lines.append(f"  {i + 1}. (completed)")
     completed_summary = "\n".join(steps_summary_lines) if steps_summary_lines else "none yet"
 
+    # --- Retrieve stored search context from /plan call ---
+    search_context = get_stored_search_context(goal)
+    if search_context:
+        print(f"[next] rid={request_id} using {len(search_context)} chars of stored search context")
+
     try:
         # --- YOLO on fresh screenshot ---
         elements = detect_elements(screenshot_bytes)
@@ -114,6 +120,7 @@ async def next_step(
             num_completed=num_completed,
             total_steps=total_steps,
             request_id=request_id,
+            search_context=search_context,
         )
 
         status = result.get("status", "done")
@@ -128,6 +135,12 @@ async def next_step(
                 label = step_data.get("label")
                 confidence = step_data.get("confidence", 0.5)
                 advance_type = step_data.get("advance", "click_in_target")
+                reasoning = step_data.get("reasoning", "")
+
+                # Log Gemini's reasoning for debugging element selection
+                if reasoning:
+                    print(f"[next] rid={request_id} step={step_id} REASONING: {reasoning}")
+                print(f"[next] rid={request_id} step={step_id} element_id={step_data.get('element_id')} box_2d={step_data.get('box_2d')} label={label!r}")
 
                 rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "next")
 

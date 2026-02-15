@@ -7,6 +7,7 @@
 #
 # Pipeline: Screenshot → YOLO full image → annotated screenshot → single Gemini call → StepPlan
 
+import asyncio
 import io
 import json
 import os
@@ -30,6 +31,7 @@ from app.schemas.step_plan import (
 )
 from app.services.agent import AgentError, is_native_genai_available, upload_images_to_gemini
 from app.services.mock import get_mock_plan
+from app.services.search import search_for_goal, get_stored_search_context
 from app.services.omniparser import (
     OmniElement,
     OmniParserResult,
@@ -903,15 +905,17 @@ async def create_plan(
     app_context: str = Form(None),
     session_summary: str = Form(None),
     markers_json: str = Form(None),
+    skip_search: bool = Form(False),
 ):
     """
     Generate a step-by-step guidance plan from a goal and screenshot.
 
     Pipeline: Screenshot → YOLO full image → annotated screenshot → single Gemini call → StepPlan
     One YOLO pass + one LLM call. No SOM grid, no cropping, no refinement.
+    Web search runs concurrently to enrich the LLM prompt with relevant context.
     """
     request_id = getattr(request.state, "request_id", "unknown")
-    print(f"[plan] rid={request_id} goal={goal!r} pipeline=gemini-oneshot")
+    print(f"[plan] rid={request_id} goal={goal!r} pipeline=gemini-oneshot skip_search={skip_search}")
 
     # --- Parse and validate image_size ---
     try:
@@ -949,6 +953,24 @@ async def create_plan(
             print(f"[plan] rid={request_id} failed to save {path}: {e}")
 
     try:
+        # ===== STEP 0: Kick off web search concurrently (non-blocking) =====
+        search_task = None
+        if not skip_search:
+            async def _safe_search() -> str:
+                try:
+                    return await search_for_goal(
+                        goal=goal,
+                        screenshot_bytes=screenshot_bytes,
+                        app_context=app_context,
+                        request_id=request_id,
+                    )
+                except Exception as e:
+                    print(f"[plan] rid={request_id} search failed (non-fatal): {type(e).__name__}: {e}")
+                    return ""
+            search_task = asyncio.create_task(_safe_search())
+        else:
+            print(f"[plan] rid={request_id} search skipped (skip_search=true)")
+
         # ===== STEP 1: Save original screenshot =====
         _dbg("original_screenshot", screenshot_bytes,
              f"{parsed_size.w}x{parsed_size.h}")
@@ -970,6 +992,13 @@ async def create_plan(
         elements_ctx = format_elements_context(elements)
         print(f"[plan] rid={request_id} elements:\n{elements_ctx}")
 
+        # ===== STEP 3.5: Collect search results if available =====
+        search_context = ""
+        if search_task is not None:
+            search_context = await search_task
+            if search_context:
+                print(f"[plan] rid={request_id} search returned {len(search_context)} chars of context")
+
         # ===== STEP 4: Single Gemini call — one-shot plan =====
         from app.services.agent import generate_gemini_plan
         result = await generate_gemini_plan(
@@ -978,6 +1007,7 @@ async def create_plan(
             raw_screenshot_bytes=screenshot_bytes,
             elements_context=elements_ctx,
             request_id=request_id,
+            search_context=search_context,
         )
 
         # ===== STEP 5: Convert Gemini response → StepPlan with YOLO snapping =====
@@ -989,6 +1019,12 @@ async def create_plan(
             label = step_data.get("label")
             confidence = step_data.get("confidence", 0.5)
             advance_type = step_data.get("advance", "click_in_target")
+            reasoning = step_data.get("reasoning", "")
+
+            # Log Gemini's reasoning for debugging element selection
+            if reasoning:
+                print(f"[plan] rid={request_id} step={step_id} REASONING: {reasoning}")
+            print(f"[plan] rid={request_id} step={step_id} element_id={step_data.get('element_id')} box_2d={step_data.get('box_2d')} label={label!r}")
 
             rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "plan")
 
@@ -1048,6 +1084,7 @@ async def create_plan_stream(
     session_summary: str = Form(None),
     markers_json: str = Form(None),
     session_id: str = Form(None),
+    skip_search: bool = Form(False),
 ):
     """
     Streaming version of /plan. Returns newline-delimited JSON (NDJSON):
@@ -1055,9 +1092,10 @@ async def create_plan_stream(
       Line 2: {"type":"plan","data":{...full StepPlan...}} — when complete
 
     If session_id is provided (from /start), uses cached YOLO results — skips detection.
+    Web search runs concurrently to enrich the LLM prompt with relevant context.
     """
     request_id = getattr(request.state, "request_id", "unknown")
-    print(f"[plan-stream] rid={request_id} goal={goal!r} session_id={session_id!r}")
+    print(f"[plan-stream] rid={request_id} goal={goal!r} session_id={session_id!r} skip_search={skip_search}")
 
     # Try to use cached session from /start
     cached = _session_cache.pop(session_id, None) if session_id else None
@@ -1091,6 +1129,22 @@ async def create_plan_stream(
         if len(screenshot_bytes) == 0:
             raise HTTPException(status_code=422, detail="Screenshot file is empty")
 
+    # Kick off search concurrently before entering the event stream
+    search_task = None
+    if not skip_search:
+        async def _safe_search() -> str:
+            try:
+                return await search_for_goal(
+                    goal=goal,
+                    screenshot_bytes=screenshot_bytes,
+                    app_context=app_context,
+                    request_id=request_id,
+                )
+            except Exception as e:
+                print(f"[plan-stream] rid={request_id} search failed (non-fatal): {type(e).__name__}: {e}")
+                return ""
+        search_task = asyncio.create_task(_safe_search())
+
     async def event_stream():
         try:
             # Use prefetched YOLO results if available, else run fresh
@@ -1108,6 +1162,13 @@ async def create_plan_stream(
 
             elem_map = {e.id: e for e in elements}
 
+            # Collect search results if available
+            search_context = ""
+            if search_task is not None:
+                search_context = await search_task
+                if search_context:
+                    print(f"[plan-stream] rid={request_id} search returned {len(search_context)} chars of context")
+
             # Choose streaming path: native Gemini files (fast) or OpenAI-compat (fallback)
             if gemini_annotated_file is not None and gemini_raw_file is not None:
                 from app.services.agent import generate_gemini_plan_with_files_stream
@@ -1117,6 +1178,7 @@ async def create_plan_stream(
                     raw_file=gemini_raw_file,
                     elements_context=elements_ctx,
                     request_id=request_id,
+                    search_context=search_context,
                 )
                 print(f"[plan-stream] rid={request_id} using native Gemini files path (fast)")
             else:
@@ -1127,6 +1189,7 @@ async def create_plan_stream(
                     raw_screenshot_bytes=screenshot_bytes,
                     elements_context=elements_ctx,
                     request_id=request_id,
+                    search_context=search_context,
                 )
                 print(f"[plan-stream] rid={request_id} using OpenAI-compat path (fallback)")
 
@@ -1150,6 +1213,12 @@ async def create_plan_stream(
                 label = step_data.get("label")
                 confidence = step_data.get("confidence", 0.5)
                 advance_type = step_data.get("advance", "click_in_target")
+                reasoning = step_data.get("reasoning", "")
+
+                # Log Gemini's reasoning for debugging element selection
+                if reasoning:
+                    print(f"[plan-stream] rid={request_id} step={step_id} REASONING: {reasoning}")
+                print(f"[plan-stream] rid={request_id} step={step_id} element_id={step_data.get('element_id')} box_2d={step_data.get('box_2d')} label={label!r}")
 
                 rx, ry, rw, rh = _resolve_bbox(step_data, elements, request_id, "plan-stream")
 
