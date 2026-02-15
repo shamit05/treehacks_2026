@@ -102,6 +102,24 @@ def _extract_json(raw: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Model-adaptive parameters
+# ---------------------------------------------------------------------------
+
+def _model_params(model: str, max_tokens: int) -> dict:
+    """
+    Return API kwargs adapted for the model.
+    Some models (gpt-5-mini, o-series) require max_completion_tokens
+    instead of max_tokens, and only support temperature=1.
+    """
+    # Models that need the new-style parameters
+    new_style = any(tag in model.lower() for tag in ["gpt-5", "o1", "o3", "o4"])
+    if new_style:
+        return {"max_completion_tokens": max_tokens, "temperature": 1}
+    else:
+        return {"max_tokens": max_tokens, "temperature": 0.1}
+
+
+# ---------------------------------------------------------------------------
 # Main generation function
 # ---------------------------------------------------------------------------
 MAX_RETRIES = 1  # retry once on invalid JSON
@@ -164,8 +182,7 @@ async def generate_plan(
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=2000,
-                temperature=0.1,
+                **_model_params(model, 2000),
                 response_format={"type": "json_object"},
             )
 
@@ -235,8 +252,7 @@ async def generate_refined_bbox(
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=500,
-                temperature=0.1,
+                **_model_params(model, 500),
                 response_format={"type": "json_object"},
             )
             raw_text = response.choices[0].message.content or ""
@@ -316,8 +332,7 @@ async def generate_replan(
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=2000,
-                temperature=0.1,
+                **_model_params(model, 2000),
                 response_format={"type": "json_object"},
             )
 
@@ -400,8 +415,7 @@ async def generate_next_step(
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=1000,
-                temperature=0.1,
+                **_model_params(model, 1000),
                 response_format={"type": "json_object"},
             )
 
@@ -481,8 +495,7 @@ async def generate_som_plan(
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=2000,
-                temperature=0.1,
+                **_model_params(model, 2000),
                 response_format={"type": "json_object"},
             )
 
@@ -556,8 +569,7 @@ async def generate_refine(
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=500,
-                temperature=0.1,
+                **_model_params(model, 500),
                 response_format={"type": "json_object"},
             )
 
@@ -632,8 +644,7 @@ async def generate_som_refine(
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=500,
-                temperature=0.1,
+                **_model_params(model, 500),
                 response_format={"type": "json_object"},
             )
 

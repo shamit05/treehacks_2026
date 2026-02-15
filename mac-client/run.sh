@@ -89,8 +89,16 @@ sign_app_if_needed() {
   fi
 }
 
-if [ "$DO_REBUILD" = true ]; then
+# Only sign once — on first install. After that, skip signing so
+# the CDHash stays the same and macOS permissions persist across rebuilds.
+# The binary changes but the signature stays, so macOS may complain once
+# about a "damaged" app — just right-click > Open to bypass that one time.
+SIGNED_MARKER="$CONTENTS/.signed_once"
+if [ "$DO_REBUILD" = true ] && [ ! -f "$SIGNED_MARKER" ]; then
   sign_app_if_needed
+  touch "$SIGNED_MARKER"
+elif [ "$DO_REBUILD" = true ]; then
+  echo "Skipping re-sign to preserve Screen Recording & Accessibility permissions."
 fi
 
 echo "Installed to $APP_PATH"
