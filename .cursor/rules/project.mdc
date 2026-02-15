@@ -1,10 +1,10 @@
 ---
-description: Project-wide rules for the OverlayGuide hackathon project
+description: Project-wide rules for The Cookbook hackathon project
 globs:
 alwaysApply: true
 ---
 
-# OverlayGuide — Cursor Rules
+# The Cookbook — Cursor Rules
 
 ## Project Overview
 macOS system-wide AI guidance overlay. Swift frontend (SwiftUI + AppKit), Python FastAPI backend, shared JSON schema. Read `docs/spec.md` for the full spec.

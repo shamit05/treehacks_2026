@@ -1,4 +1,4 @@
-# OverlayGuide
+# The Cookbook
 
 A macOS system-wide AI guidance overlay. Press a hotkey, describe what you want to do, and get step-by-step visual instructions overlaid on top of any app.
 
@@ -31,12 +31,12 @@ chmod +x run.sh
 ./run.sh
 ```
 
-On first run, add **OverlayGuide** to System Settings > Privacy & Security > Accessibility (click + and select the OverlayGuide.app that appears). Then press **Cmd+Option+O** to toggle the overlay.
+On first run, add **The Cookbook** to System Settings > Privacy & Security > Accessibility (click + and select the TheCookbook.app that appears). Then press **Cmd+Option+O** to toggle the overlay.
 
 **Or build and run directly:**
 ```bash
 cd mac-client
-swift run OverlayGuide
+swift run TheCookbook
 ```
 (Requires adding Terminal to Accessibility, or the binary path when prompted.)
 
@@ -68,7 +68,7 @@ mac-client/                 # Swift macOS app
     State/                  # State machine + session state
     Networking/             # HTTP client to agent-server
     Models/                 # Shared data models (StepPlan, etc.)
-    UI/                     # SwiftUI views (goal input, completion)
+    UI/                     # SwiftUI views (goal input, completion, onboarding)
 agent-server/               # Python FastAPI backend
   app/
     main.py                 # App entry + CORS
@@ -116,7 +116,7 @@ Run the mac client in synthetic UI test mode and pass parameters:
 
 ```bash
 cd mac-client
-swift run OverlayGuide --ui-test --goal "Create calendar event" --steps 4 --x 0.22 --y 0.24 --w 0.18 --h 0.05 --next-after 3
+swift run TheCookbook --ui-test --goal "Create calendar event" --steps 4 --x 0.22 --y 0.24 --w 0.18 --h 0.05 --next-after 3
 ```
 
 - Prints the generated `StepPlan` JSON to terminal (`initial`, then `next` if `--next-after` is provided)
@@ -127,5 +127,5 @@ See all test flags:
 
 ```bash
 cd mac-client
-swift run OverlayGuide --ui-test-help
+swift run TheCookbook --ui-test-help
 ```

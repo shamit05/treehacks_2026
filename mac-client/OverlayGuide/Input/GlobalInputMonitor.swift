@@ -24,14 +24,20 @@ class GlobalInputMonitor {
     private var globalKeyMonitor: Any?
     private var lastHotkeyAt: Date?
 
+    /// Called when the user presses the preferences hotkey (Cmd+Option+,)
+    var onOpenPreferences: (() -> Void)?
+
     // Hotkey configs
     private static let hotkeySignature: OSType = 0x4F564947  // "OVIG"
     private static let hotkeyPrimaryID: UInt32 = 1
     private static let hotkeySecondaryID: UInt32 = 2
+    private static let hotkeyPrefsID: UInt32 = 3
     private static let primaryKeyCode: UInt16 = 31   // kVK_ANSI_O
     private static let primaryModifiers: UInt32 = UInt32(cmdKey | optionKey)
     private static let secondaryKeyCode: UInt16 = 31 // kVK_ANSI_O (Cmd+Shift+O)
     private static let secondaryModifiers: UInt32 = UInt32(cmdKey | shiftKey)
+    private static let prefsKeyCode: UInt16 = 43     // kVK_ANSI_Comma
+    private static let prefsModifiers: UInt32 = UInt32(cmdKey | optionKey)
 
     init(stateMachine: GuidanceStateMachine) {
         self.stateMachine = stateMachine
@@ -44,7 +50,7 @@ class GlobalInputMonitor {
         registerFallbackGlobalKeyMonitor()
         startMouseTap()
         registerEscapeMonitor()
-        print("[InputMonitor] Started. Hotkeys: Cmd+Option+O or Cmd+Shift+O. Escape to dismiss.")
+        print("[InputMonitor] Started. Hotkeys: Cmd+Option+O or Cmd+Shift+O (overlay), Cmd+Option+, (preferences). Escape to dismiss.")
     }
 
     func stop() {
@@ -67,11 +73,28 @@ class GlobalInputMonitor {
         var handlerRef: EventHandlerRef?
         let handlerStatus = InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, userData -> OSStatus in
-                guard let userData = userData else { return noErr }
+            { _, inEvent, userData -> OSStatus in
+                guard let userData = userData, let inEvent = inEvent else { return noErr }
                 let monitor = Unmanaged<GlobalInputMonitor>.fromOpaque(userData).takeUnretainedValue()
+
+                // Read which hotkey was pressed
+                var hotkeyID = EventHotKeyID()
+                GetEventParameter(
+                    inEvent,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hotkeyID
+                )
+
                 DispatchQueue.main.async {
-                    monitor.triggerHotkey()
+                    if hotkeyID.id == GlobalInputMonitor.hotkeyPrefsID {
+                        monitor.triggerPrefsHotkey()
+                    } else {
+                        monitor.triggerHotkey()
+                    }
                 }
                 return noErr
             },
@@ -96,6 +119,11 @@ class GlobalInputMonitor {
             id: Self.hotkeySecondaryID,
             keyCode: Self.secondaryKeyCode,
             modifiers: Self.secondaryModifiers
+        )
+        registerHotKey(
+            id: Self.hotkeyPrefsID,
+            keyCode: Self.prefsKeyCode,
+            modifiers: Self.prefsModifiers
         )
     }
 
@@ -139,7 +167,13 @@ class GlobalInputMonitor {
                 flags.contains(.command) && flags.contains(.option)
             let secondaryMatch = event.keyCode == Self.secondaryKeyCode &&
                 flags.contains(.command) && flags.contains(.shift)
-            if primaryMatch || secondaryMatch {
+            let prefsMatch = event.keyCode == Self.prefsKeyCode &&
+                flags.contains(.command) && flags.contains(.option)
+            if prefsMatch {
+                DispatchQueue.main.async {
+                    self.triggerPrefsHotkey()
+                }
+            } else if primaryMatch || secondaryMatch {
                 DispatchQueue.main.async {
                     self.triggerHotkey()
                 }
@@ -160,7 +194,7 @@ class GlobalInputMonitor {
     private var localEscapeMonitor: Any?
 
     private func registerEscapeMonitor() {
-        // Global monitor (when OverlayGuide is not focused)
+        // Global monitor (when The Cookbook is not focused)
         escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.keyCode == 53 { // kVK_Escape
                 DispatchQueue.main.async {
@@ -168,7 +202,7 @@ class GlobalInputMonitor {
                 }
             }
         }
-        // Local monitor (when OverlayGuide panel is focused)
+        // Local monitor (when The Cookbook panel is focused)
         localEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.keyCode == 53 { // kVK_Escape
                 DispatchQueue.main.async {
@@ -204,9 +238,18 @@ class GlobalInputMonitor {
             return
         }
         lastHotkeyAt = Date()
-        // Do NOT activate OverlayGuide — the target app should stay active
+        // Do NOT activate The Cookbook — the target app should stay active
         // so its menu bar remains visible and screenshots capture it correctly.
         stateMachine.toggleOverlay()
+    }
+
+    private func triggerPrefsHotkey() {
+        if let last = lastHotkeyAt, Date().timeIntervalSince(last) < 0.35 {
+            return
+        }
+        lastHotkeyAt = Date()
+        print("[InputMonitor] Preferences hotkey pressed (Cmd+Option+,)")
+        onOpenPreferences?()
     }
 
     // MARK: - Mouse Click Detection

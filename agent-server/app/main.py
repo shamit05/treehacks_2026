@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     openrouter_key = bool(os.getenv("OPENROUTER_API_KEY"))
     provider = "Gemini" if gemini_key else ("OpenAI" if openai_key else ("OpenRouter" if openrouter_key else "NONE"))
     has_key = gemini_key or openai_key or openrouter_key
-    print(f"[server] OverlayGuide Agent Server starting")
+    print(f"[server] The Cookbook Agent Server starting")
     print(f"[server]   MOCK_MODE={mock_mode}")
     print(f"[server]   PROVIDER={provider}")
     print(f"[server]   MODEL={model}")
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="OverlayGuide Agent Server",
+    title="The Cookbook Agent Server",
     description="AI agent that generates step-by-step UI guidance plans from screenshots",
     version="0.1.0",
     lifespan=lifespan,

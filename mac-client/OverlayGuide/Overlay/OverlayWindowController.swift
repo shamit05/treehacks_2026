@@ -122,7 +122,7 @@ class OverlayWindowController {
         switch phase {
         case .inputGoal, .loading, .guiding, .completed, .error:
             // Show the panel and give it keyboard focus, but do NOT
-            // activate OverlayGuide — the target app stays in front.
+            // activate The Cookbook — the target app stays in front.
             panel.orderFrontRegardless()
             panel.makeKey()
         case .idle:

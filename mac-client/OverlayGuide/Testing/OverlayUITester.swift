@@ -104,7 +104,7 @@ enum OverlayUITester {
     static func printUsage() {
         let usage = """
         Overlay UI Tester usage:
-          swift run OverlayGuide --ui-test [options]
+          swift run TheCookbook --ui-test [options]
 
         Options:
           --goal <text>          Goal text shown in plan (default: "UI test goal")

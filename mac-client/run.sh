@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch OverlayGuide from a stable app bundle path.
+# Launch The Cookbook from a stable app bundle path.
 # By default this ONLY launches to preserve macOS permissions.
 # Use --rebuild when you intentionally want to rebuild/update the app binary.
 # Usage:
@@ -9,8 +9,8 @@
 set -e
 cd "$(dirname "$0")"
 
-BINARY=".build/debug/OverlayGuide"
-APP_NAME="OverlayGuide.app"
+BINARY=".build/debug/TheCookbook"
+APP_NAME="TheCookbook.app"
 INSTALL_DIR="$HOME/Applications"
 APP_PATH="$INSTALL_DIR/$APP_NAME"
 CONTENTS="$APP_PATH/Contents"
@@ -23,12 +23,12 @@ if [ "${1:-}" = "--rebuild" ]; then
   DO_REBUILD=true
 fi
 
-if [ ! -f "$APP_PATH/Contents/MacOS/OverlayGuide" ]; then
+if [ ! -f "$APP_PATH/Contents/MacOS/TheCookbook" ]; then
   DO_REBUILD=true
 fi
 
 if [ "$DO_REBUILD" = true ]; then
-  echo "Building OverlayGuide..."
+  echo "Building The Cookbook..."
   swift build
 fi
 
@@ -38,8 +38,8 @@ mkdir -p "$RESOURCES"
 
 # Copy latest built binary into stable app bundle only on rebuild/install.
 if [ "$DO_REBUILD" = true ]; then
-  cp "$BINARY" "$MACOS/OverlayGuide"
-  chmod +x "$MACOS/OverlayGuide"
+  cp "$BINARY" "$MACOS/TheCookbook"
+  chmod +x "$MACOS/TheCookbook"
 fi
 
 # Create Info.plist only once (keep bundle identity stable).
@@ -50,19 +50,19 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>OverlayGuide</string>
+    <string>TheCookbook</string>
     <key>CFBundleIdentifier</key>
-    <string>com.overlayguide.app</string>
+    <string>com.thecookbook.app</string>
     <key>CFBundleName</key>
-    <string>OverlayGuide</string>
+    <string>The Cookbook</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>OverlayGuide uses the microphone for voice input so you can speak your goal instead of typing.</string>
+    <string>The Cookbook uses the microphone for voice input so you can speak your goal instead of typing.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>OverlayGuide uses speech recognition to convert your voice into text for goal input.</string>
+    <string>The Cookbook uses speech recognition to convert your voice into text for goal input.</string>
 </dict>
 </plist>
 EOF
@@ -106,7 +106,7 @@ elif [ "$DO_REBUILD" = true ]; then
 fi
 
 echo "Installed to $APP_PATH"
-echo "Bundle identifier: com.overlayguide.app"
+echo "Bundle identifier: com.thecookbook.app"
 if [ "$DO_REBUILD" = true ]; then
   echo "Mode: rebuild + launch"
 else
@@ -114,19 +114,19 @@ else
 fi
 
 echo ""
-echo "Launching OverlayGuide..."
+echo "Launching The Cookbook..."
 echo ""
 echo "If hotkey (Cmd+Option+O) doesn't work:"
 echo "  1. System Settings > Privacy & Security > Accessibility"
-echo "  2. Remove OverlayGuide if listed, then click +"
+echo "  2. Remove TheCookbook if listed, then click +"
 echo "  3. Press Cmd+Shift+G, paste: $INSTALL_DIR"
-echo "  4. Select OverlayGuide.app, click Open"
-echo "  5. Quit OverlayGuide (Cmd+Q) and run ./run.sh again"
+echo "  4. Select TheCookbook.app, click Open"
+echo "  5. Quit The Cookbook (Cmd+Q) and run ./run.sh again"
 echo ""
 echo "NOTE: Use ./run.sh for launch-only to preserve Screen Recording permission."
 echo "      Use ./run.sh --rebuild only when you intentionally want new code."
 echo ""
 
 # Ensure stale instance is closed before launching the fresh build
-pkill -x OverlayGuide >/dev/null 2>&1 || true
+pkill -x TheCookbook >/dev/null 2>&1 || true
 open -n "$APP_PATH"

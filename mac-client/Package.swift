@@ -4,13 +4,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "OverlayGuide",
+    name: "TheCookbook",
     platforms: [
         .macOS(.v13)
     ],
     targets: [
         .executableTarget(
-            name: "OverlayGuide",
+            name: "TheCookbook",
             path: "OverlayGuide"
         ),
     ]

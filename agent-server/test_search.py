@@ -490,7 +490,7 @@ TEST_MAP = {
 def main():
     args = sys.argv[1:]
     print(f"\n{'='*60}")
-    print("  OverlayGuide — Search Integration Tests")
+    print("  The Cookbook — Search Integration Tests")
     print(f"{'='*60}")
 
     if args:

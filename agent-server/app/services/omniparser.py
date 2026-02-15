@@ -118,6 +118,53 @@ def _get_yolo_model():
     return _yolo_model
 
 
+# ---------------------------------------------------------------------------
+# Element quality filtering
+# ---------------------------------------------------------------------------
+# These thresholds control the quality/quantity tradeoff for detected elements.
+# Fewer high-quality elements = cleaner annotated image = LLM picks the right box.
+# Lots of noisy elements = cluttered image = LLM misreads box numbers.
+
+_MIN_CONFIDENCE = 0.15       # Ignore elements below this YOLO confidence
+_MIN_AREA = 0.0003           # Ignore elements smaller than ~0.03% of screen (tiny dots)
+_MAX_AREA = 0.25             # Ignore elements larger than 25% of screen (full panels)
+_MAX_ELEMENTS = 80           # Hard cap — keep the N highest-confidence elements
+_DEDUP_IOU_THRESHOLD = 0.6   # Merge near-duplicate boxes (high overlap)
+
+
+def _compute_iou(a: list[float], b: list[float]) -> float:
+    """IoU between two [x1,y1,x2,y2] boxes."""
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _deduplicate_boxes(elements: list[tuple[float, list[float]]]) -> list[tuple[float, list[float]]]:
+    """
+    Remove near-duplicate boxes. Keep the higher-confidence one
+    when two boxes overlap significantly (IoU > threshold).
+    Elements should be sorted by confidence (highest first).
+    """
+    kept: list[tuple[float, list[float]]] = []
+    for conf, bbox in elements:
+        is_dup = False
+        for _, kept_bbox in kept:
+            if _compute_iou(bbox, kept_bbox) > _DEDUP_IOU_THRESHOLD:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append((conf, bbox))
+    return kept
+
+
 def detect_elements(
     screenshot_bytes: bytes,
     box_threshold: float = 0.05,
@@ -125,8 +172,11 @@ def detect_elements(
 ) -> list[OmniElement]:
     """
     Run OmniParser YOLO v2 model on a screenshot.
-    Returns all detected elements with normalized bboxes, sorted by
-    confidence (highest first) so the LLM sees the best candidates first.
+    Returns detected elements with normalized bboxes, filtered for quality:
+      1. Confidence >= _MIN_CONFIDENCE
+      2. Area within [_MIN_AREA, _MAX_AREA]
+      3. Deduplicated (high-IoU merging)
+      4. Capped at _MAX_ELEMENTS (highest confidence kept)
     """
     model = _get_yolo_model()
 
@@ -137,7 +187,6 @@ def detect_elements(
 
     try:
         # Use 1024px for better detection of small UI elements on Retina displays.
-        # Default 640px loses too many menu items, small buttons, and icons.
         results = model.predict(
             source=tmp_path,
             conf=box_threshold,
@@ -154,19 +203,41 @@ def detect_elements(
                 conf = box.conf[0].item()
                 raw_elements.append((conf, [x1, y1, x2, y2]))
 
+        raw_count = len(raw_elements)
+
         # Sort by confidence (highest first)
         raw_elements.sort(key=lambda x: x[0], reverse=True)
 
+        # --- Filter 1: confidence ---
+        raw_elements = [(c, b) for c, b in raw_elements if c >= _MIN_CONFIDENCE]
+
+        # --- Filter 2: area (remove tiny dots and huge panels) ---
+        filtered = []
+        for conf, bbox in raw_elements:
+            w_norm = bbox[2] - bbox[0]
+            h_norm = bbox[3] - bbox[1]
+            area = w_norm * h_norm
+            if _MIN_AREA <= area <= _MAX_AREA:
+                filtered.append((conf, bbox))
+        raw_elements = filtered
+
+        # --- Filter 3: deduplicate overlapping boxes ---
+        raw_elements = _deduplicate_boxes(raw_elements)
+
+        # --- Filter 4: cap count ---
+        raw_elements = raw_elements[:_MAX_ELEMENTS]
+
+        print(f"[omniparser] filtered: {raw_count} raw -> {len(raw_elements)} elements "
+              f"(conf>={_MIN_CONFIDENCE}, area in [{_MIN_AREA},{_MAX_AREA}], dedup, cap={_MAX_ELEMENTS})")
+
         elements: list[OmniElement] = []
         for i, (conf, bbox) in enumerate(raw_elements):
-            # Describe location and size to help the LLM match visually
             cx = (bbox[0] + bbox[2]) / 2
             cy = (bbox[1] + bbox[3]) / 2
             w_norm = bbox[2] - bbox[0]
             h_norm = bbox[3] - bbox[1]
             loc = _describe_location(cx, cy)
 
-            # Classify element size to help LLM distinguish buttons from icons etc.
             area = w_norm * h_norm
             if area < 0.001:
                 size = "tiny"
@@ -205,16 +276,25 @@ def draw_numbered_boxes(
 ) -> bytes:
     """
     Draw numbered bounding boxes on the screenshot for each detected element.
+    Optimized for LLM readability:
+      - Thin box outlines (don't obscure content)
+      - Large, high-contrast number labels with pill backgrounds
+      - Labels placed OUTSIDE the box (above) when possible, to keep
+        the element's content visible
+      - Consistent bright colors with dark text for maximum contrast
     Returns annotated PNG bytes.
     """
-    img = Image.open(io.BytesIO(screenshot_bytes)).convert("RGB")
+    img = Image.open(io.BytesIO(screenshot_bytes)).convert("RGBA")
     actual_w, actual_h = img.size
-    draw = ImageDraw.Draw(img)
 
-    # Medium font — readable after OpenAI downscaling but not overwhelming.
-    # On 3024px image: font=34px, border=4px.
-    font_size = max(18, actual_w // 90)
-    border_width = max(3, actual_w // 600)
+    # Transparent overlay for boxes + labels (so we don't paint over text)
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # Larger font for readability — must survive Gemini's image downscaling.
+    # On 3024px image: font=42px. On 1512px: font=24px.
+    font_size = max(20, actual_w // 72)
+    border_width = max(2, actual_w // 800)
 
     try:
         font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
@@ -224,15 +304,20 @@ def draw_numbered_boxes(
         except Exception:
             font = ImageFont.load_default()
 
-    # Color palette for variety
-    colors = [
-        (255, 50, 50),    # red
-        (50, 150, 255),   # blue
-        (50, 200, 50),    # green
-        (255, 165, 0),    # orange
-        (200, 50, 200),   # purple
-        (0, 200, 200),    # cyan
+    # High-contrast color palette — bright backgrounds with dark text.
+    # Using fewer, more distinct colors to reduce visual confusion.
+    label_colors = [
+        (255, 255, 50),    # yellow
+        (50, 255, 50),     # green
+        (50, 200, 255),    # cyan
+        (255, 150, 50),    # orange
+        (255, 100, 255),   # magenta
+        (150, 255, 150),   # light green
+        (255, 200, 100),   # gold
+        (100, 255, 255),   # light cyan
     ]
+    # Box outline color: semi-transparent to not obscure content
+    box_outline_alpha = 180
 
     for elem in elements:
         x1 = int(elem.bbox_xyxy[0] * actual_w)
@@ -240,29 +325,39 @@ def draw_numbered_boxes(
         x2 = int(elem.bbox_xyxy[2] * actual_w)
         y2 = int(elem.bbox_xyxy[3] * actual_h)
 
-        color = colors[elem.id % len(colors)]
+        color = label_colors[elem.id % len(label_colors)]
+        outline_color = (*color, box_outline_alpha)
 
-        # Draw bounding box
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=border_width)
+        # Draw thin box outline (semi-transparent — content stays visible)
+        draw.rectangle([x1, y1, x2, y2], outline=outline_color, width=border_width)
 
-        # Draw number label INSIDE the box at top-left corner.
-        # Previously drawn ABOVE the box, which caused the label for element N
-        # to overlap element N-1 in stacked layouts (menus, lists), making the
-        # LLM pick the wrong element (off-by-one).
+        # Draw number label as a pill/badge ABOVE the box
         label = str(elem.id)
         label_bbox = draw.textbbox((0, 0), label, font=font)
-        lw = label_bbox[2] - label_bbox[0] + 10
-        lh = label_bbox[3] - label_bbox[1] + 6
+        lw = label_bbox[2] - label_bbox[0] + 14
+        lh = label_bbox[3] - label_bbox[1] + 8
 
-        # Place label at the top-left corner of the bbox, inside the box
-        lx = max(0, x1)
-        ly = max(0, y1)
+        # Try placing above the box; if too close to top edge, place inside
+        if y1 - lh - 2 >= 0:
+            lx = max(0, min(x1, actual_w - lw))
+            ly = y1 - lh - 2
+        else:
+            lx = max(0, min(x1, actual_w - lw))
+            ly = max(0, y1 + 2)
 
-        draw.rectangle([lx, ly, lx + lw, ly + lh], fill=color)
-        draw.text((lx + 5, ly + 3), label, fill=(255, 255, 255), font=font)
+        # Pill background (bright, opaque) with dark text
+        draw.rounded_rectangle(
+            [lx, ly, lx + lw, ly + lh],
+            radius=4,
+            fill=(*color, 230),
+        )
+        draw.text((lx + 7, ly + 4), label, fill=(0, 0, 0, 255), font=font)
+
+    # Composite overlay onto the screenshot
+    result = Image.alpha_composite(img, overlay).convert("RGB")
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    result.save(buf, format="PNG")
     return buf.getvalue()
 
 

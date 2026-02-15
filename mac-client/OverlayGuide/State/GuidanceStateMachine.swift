@@ -56,6 +56,14 @@ class GuidanceStateMachine: ObservableObject {
     private let lastScreenshotPath = "/tmp/overlayguide_last_screenshot.png"
     private let coordinateDebugEnabled = true
 
+    /// Active learning profile, pulled from UserPreferences on each request.
+    private var activeLearningProfile: LearningProfile? {
+        let prefs = UserPreferences.shared
+        let style = prefs.learningStyle
+        guard !style.isEmpty else { return nil }
+        return LearningProfile(text: style, presets: nil)
+    }
+
     init(networkClient: AgentNetworkClient, captureService: ScreenCaptureService) {
         self.networkClient = networkClient
         self.captureService = captureService
@@ -178,7 +186,7 @@ class GuidanceStateMachine: ObservableObject {
                     screenshotData: screenshot.imageData,
                     imageSize: imgSize,
                     sessionId: sessionId,
-                    learningProfile: session.learningProfile,
+                    learningProfile: self.activeLearningProfile ?? session.learningProfile,
                     onInstruction: { [weak self] instruction in
                         // Show instruction text immediately in the UI (before bbox arrives)
                         self?.streamingInstruction = instruction
@@ -385,7 +393,7 @@ class GuidanceStateMachine: ObservableObject {
                     imageSize: imgSize,
                     completedSteps: completedSteps,
                     totalSteps: max(completedSteps.count, session.stepPlan?.steps.count ?? plan.steps.count),
-                    learningProfile: session.learningProfile,
+                    learningProfile: self.activeLearningProfile ?? session.learningProfile,
                     appContext: session.appContext
                 )
                 applyNextResponse(nextResponse)

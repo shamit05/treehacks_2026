@@ -9,6 +9,11 @@
 import AppKit
 import SwiftUI
 
+// Notification posted when user taps the gear icon to open preferences
+extension Notification.Name {
+    static let openCookbookPreferences = Notification.Name("openCookbookPreferences")
+}
+
 // MARK: - Main Content View (unified panel)
 
 struct OverlayContentView: View {
@@ -46,12 +51,14 @@ struct OverlayContentView: View {
             // Green tint overlay for completed state — drawn on top of opaque bg
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(isCompleted ? Color.green.opacity(0.12) : Color.clear)
+                .allowsHitTesting(false)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(isCompleted
                     ? Color.green.opacity(0.4)
                     : Color.secondary.opacity(0.25), lineWidth: 1)
+                .allowsHitTesting(false)
         )
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .shadow(color: .black.opacity(0.15), radius: 12, y: 4)
@@ -111,6 +118,16 @@ struct OverlayContentView: View {
                     .buttonStyle(.plain)
                     .foregroundColor(voiceInput.isListening ? .red : .secondary)
                     .help(voiceInput.isListening ? "Stop voice input" : "Start voice input")
+
+                    Button(action: {
+                        NotificationCenter.default.post(name: .openCookbookPreferences, object: nil)
+                    }) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 13, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.secondary.opacity(0.6))
+                    .help("Learning preferences (Cmd+Option+,)")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 11)

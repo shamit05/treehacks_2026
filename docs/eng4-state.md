@@ -14,7 +14,7 @@ mac-client/OverlayGuide/
     StepPlan.swift                  # Codable models matching JSON schema
     SessionState.swift              # Session snapshot, events, learning profile
   App/                              # App entry point + wiring
-    OverlayGuideApp.swift           # @main SwiftUI App
+    TheCookbookApp.swift            # @main SwiftUI App
     AppDelegate.swift               # Creates all services, wires them together
 ```
 
