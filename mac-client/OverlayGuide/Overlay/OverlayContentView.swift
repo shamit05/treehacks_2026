@@ -1,9 +1,7 @@
 // Overlay/OverlayContentView.swift
 // Owner: Eng 1 (Overlay UI)
 //
-// SwiftUI view rendered inside each overlay NSPanel.
-// Draws highlight rectangles and instruction bubbles for the current step.
-// Stateless — reads everything from the state machine.
+// SwiftUI content rendered inside the popup overlay window.
 
 import SwiftUI
 
@@ -40,7 +38,8 @@ struct OverlayContentView: View {
                     InstructionBubble(
                         instruction: step.instruction,
                         stepNumber: stateMachine.currentStepIndex + 1,
-                        totalSteps: plan.steps.count
+                        totalSteps: plan.steps.count,
+                        hintMessage: stateMachine.hintMessage
                     )
                 } else {
                     VStack(spacing: 8) {
@@ -83,21 +82,31 @@ struct InstructionBubble: View {
     let instruction: String
     let stepNumber: Int
     let totalSteps: Int
+    let hintMessage: String?
     @State private var dragOffset: CGSize = .zero
     @State private var dragStartOffset: CGSize = .zero
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Step \(stepNumber) of \(totalSteps)")
-                .font(.caption)
-                .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Step \(stepNumber) of \(totalSteps)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
 
             Text(instruction)
                 .font(.body)
                 .foregroundColor(.primary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let hintMessage {
+                Text(hintMessage)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
         }
-        .padding()
+        .padding(14)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .offset(dragOffset)

@@ -1,9 +1,7 @@
 // Overlay/OverlayWindowController.swift
 // Owner: Eng 1 (Overlay UI)
 //
-// Manages one NSPanel per display. Reads from the state machine
-// and renders the current step's highlights + instruction bubble.
-// This class must NOT perform networking or own state.
+// Manages a single movable popup window for overlay UI.
 
 import AppKit
 import SwiftUI

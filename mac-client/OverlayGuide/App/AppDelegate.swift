@@ -21,6 +21,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // TODO: Check permissions (Screen Recording) and prompt if missing
 
+        if CommandLine.arguments.contains("--ui-test-help") {
+            OverlayUITester.printUsage()
+        }
+
         // Initialize services
         networkClient = AgentNetworkClient()
         captureService = ScreenCaptureService()
@@ -28,24 +32,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         overlayController = OverlayWindowController(stateMachine: stateMachine)
         inputMonitor = GlobalInputMonitor(stateMachine: stateMachine)
 
-        // Show overlay when guiding; hide when idle
+        // Keep overlay visibility in sync with state.
         phaseCancellable = stateMachine.$phase
             .receive(on: RunLoop.main)
             .sink { [weak self] phase in
-                guard let self = self else { return }
-                switch phase {
-                case .idle:
-                    self.overlayController.hideAll()
-                case .inputGoal, .loading, .guiding, .completed, .error:
-                    if case .inputGoal = phase {
-                        NSApp.activate(ignoringOtherApps: true)
-                    }
-                    self.overlayController.showOverlay(for: phase)
-                }
+                guard let self else { return }
+                self.overlayController.showOverlay(for: phase)
             }
 
-        // Start listening for hotkey + clicks
-        inputMonitor.start()
+        let isUITestMode = CommandLine.arguments.contains("--ui-test")
+        if isUITestMode {
+            OverlayUITester.runIfEnabled(stateMachine: stateMachine, args: CommandLine.arguments)
+        } else {
+            // Start listening for hotkey + clicks
+            inputMonitor.start()
+        }
 
         // Fallback: force-show the popup once at launch so window rendering
         // works even if global hotkeys are flaky in this environment.
@@ -61,6 +62,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         inputMonitor.stop()
+        phaseCancellable?.cancel()
         overlayController.hideAll()
     }
 }

@@ -103,3 +103,29 @@ Each engineer has a detailed runbook in `docs/` — **read yours before starting
 - **Commit prefixes**: `[overlay]`, `[capture]`, `[agent]`, `[state]`
 
 See `.cursor/rules/project.mdc` for the full coding rules.
+
+## Testing Overlay Output Updates
+
+- Use backend mock mode to exercise both `POST /plan` and `POST /next`.
+- The mac state machine now supports applying raw API payloads directly via `applyPlanJSON(_:asNextPlan:)` for UI-only testing.
+- Start with `shared/example_step_plan.json` as the initial payload, then paste a `/next`-shaped `StepPlan` JSON payload and call `applyPlanJSON(..., asNextPlan: true)` to verify the overlay refreshes in place.
+
+### Quick UI Tester (CLI)
+
+Run the mac client in synthetic UI test mode and pass parameters:
+
+```bash
+cd mac-client
+swift run OverlayGuide --ui-test --goal "Create calendar event" --steps 4 --x 0.22 --y 0.24 --w 0.18 --h 0.05 --next-after 3
+```
+
+- Prints the generated `StepPlan` JSON to terminal (`initial`, then `next` if `--next-after` is provided)
+- Renders the overlay directly with those synthetic steps
+- Skips hotkey/click monitor setup in this mode to make testing deterministic
+
+See all test flags:
+
+```bash
+cd mac-client
+swift run OverlayGuide --ui-test-help
+```
