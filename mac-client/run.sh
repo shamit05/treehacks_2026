@@ -17,6 +17,7 @@ CONTENTS="$APP_PATH/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 DO_REBUILD=false
+SIGNING_IDENTITY="${DEVELOPER_IDENTITY:-}"
 
 if [ "${1:-}" = "--rebuild" ]; then
   DO_REBUILD=true
@@ -63,7 +64,37 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
 EOF
 fi
 
+choose_signing_identity() {
+  if [ -n "$SIGNING_IDENTITY" ]; then
+    echo "$SIGNING_IDENTITY"
+    return
+  fi
+  security find-identity -v -p codesigning 2>/dev/null | /usr/bin/awk -F\" '/Apple Development/ {print $2; exit}'
+}
+
+sign_app_if_needed() {
+  local identity
+  identity="$(choose_signing_identity)"
+  if [ -n "$identity" ]; then
+    echo "Signing app with identity: $identity"
+    codesign --force --deep --sign "$identity" "$APP_PATH"
+    echo "Code signature verification:"
+    codesign --verify --deep --strict "$APP_PATH"
+  else
+    echo "No Apple Development signing identity found."
+    echo "Falling back to ad-hoc signing (works for local dev)."
+    codesign --force --deep --sign - "$APP_PATH"
+    echo "Code signature verification:"
+    codesign --verify --deep --strict "$APP_PATH"
+  fi
+}
+
+if [ "$DO_REBUILD" = true ]; then
+  sign_app_if_needed
+fi
+
 echo "Installed to $APP_PATH"
+echo "Bundle identifier: com.overlayguide.app"
 if [ "$DO_REBUILD" = true ]; then
   echo "Mode: rebuild + launch"
 else
