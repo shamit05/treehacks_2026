@@ -5,6 +5,7 @@
 # Sends screenshot + goal to a multimodal model, parses structured JSON response.
 # Includes retry on invalid JSON and robust error handling.
 
+import asyncio
 import base64
 import json
 import os
@@ -128,9 +129,54 @@ def _model_params(model: str, max_tokens: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Rate limit handling
+# ---------------------------------------------------------------------------
+MAX_RETRIES = 2  # retry twice (for rate limits + invalid JSON)
+
+# Global semaphore to serialize LLM calls and avoid piling up rate-limited requests
+_llm_semaphore = asyncio.Semaphore(1)
+
+
+async def _call_llm_with_backoff(client, model: str, messages: list, params: dict, request_id: str, label: str):
+    """
+    Call the LLM with rate-limit-aware retry and backoff.
+    Uses a semaphore to avoid piling up concurrent requests.
+    """
+    async with _llm_semaphore:
+        for attempt in range(1 + MAX_RETRIES):
+            try:
+                print(f"[agent] rid={request_id} {label} attempt={attempt + 1} model={model}")
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    **params,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = response.choices[0].message.content or ""
+                print(f"[agent] rid={request_id} {label} response length={len(raw_text)}")
+                return raw_text
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "rate_limit" in error_str.lower():
+                    # Extract retry-after if available, default to 25s
+                    wait = 25
+                    import re as _re
+                    match = _re.search(r"try again in (\d+\.?\d*)s", error_str)
+                    if match:
+                        wait = float(match.group(1)) + 2  # add buffer
+                    print(f"[agent] rid={request_id} {label} rate limited, waiting {wait:.0f}s...")
+                    await asyncio.sleep(wait)
+                elif attempt < MAX_RETRIES:
+                    print(f"[agent] rid={request_id} {label} attempt={attempt + 1} error: {e}")
+                    await asyncio.sleep(1)
+                else:
+                    raise
+        raise AgentError(f"{label} failed after {MAX_RETRIES + 1} attempts")
+
+
+# ---------------------------------------------------------------------------
 # Main generation function
 # ---------------------------------------------------------------------------
-MAX_RETRIES = 1  # retry once on invalid JSON
 
 
 async def generate_plan(
@@ -379,11 +425,13 @@ async def generate_next_step(
     learning_profile: str | None = None,
     app_context: str | None = None,
     request_id: str = "",
+    elements_context: str = "",
 ) -> NextStepResponse:
     """
     Given a fresh screenshot after the user completed a step, identify
     the next 1-2 actions. Returns a NextStepResponse with status
     ("continue", "done", "retry") and optional steps.
+    If elements_context is provided, the screenshot has YOLO-annotated boxes.
     """
     client = _get_client()
 
@@ -395,6 +443,7 @@ async def generate_next_step(
     prompt = prompt.replace("{{TOTAL_STEPS}}", str(total_steps))
     prompt = prompt.replace("{{LEARNING_PROFILE_TEXT}}", learning_profile or "default")
     prompt = prompt.replace("{{APP_CONTEXT_JSON}}", app_context or "{}")
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context)
 
     screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
 
@@ -415,36 +464,14 @@ async def generate_next_step(
         }
     ]
 
-    last_error: Exception | None = None
-
-    for attempt in range(1 + MAX_RETRIES):
-        try:
-            print(f"[agent] rid={request_id} next-step attempt={attempt + 1} model={model}")
-
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **_model_params(model, 1000),
-                response_format={"type": "json_object"},
-            )
-
-            raw_text = response.choices[0].message.content or ""
-            print(f"[agent] rid={request_id} next-step response length={len(raw_text)}")
-
-            plan_dict = _extract_json(raw_text)
-            result = NextStepResponse.model_validate(plan_dict)
-
-            print(f"[agent] rid={request_id} next-step validated: status={result.status} steps={len(result.steps)} message={result.message!r}")
-            return result
-
-        except AgentError:
-            raise
-        except json.JSONDecodeError as e:
-            last_error = AgentError(f"Invalid JSON from model on next-step: {e}")
-            print(f"[agent] rid={request_id} next-step attempt={attempt + 1} JSON error: {e}")
-        except Exception as e:
-            last_error = AgentError(f"Next-step model call failed: {type(e).__name__}: {e}")
-            print(f"[agent] rid={request_id} next-step attempt={attempt + 1} error: {e}")
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 1000),
+        request_id, "next-step"
+    )
+    plan_dict = _extract_json(raw_text)
+    result = NextStepResponse.model_validate(plan_dict)
+    print(f"[agent] rid={request_id} next-step validated: status={result.status} steps={len(result.steps)} message={result.message!r}")
+    return result
 
     raise last_error or AgentError("Unknown next-step failure")
 
@@ -736,38 +763,14 @@ async def generate_omniparser_plan(
         }
     ]
 
-    last_error: Exception | None = None
-
-    for attempt in range(1 + MAX_RETRIES):
-        try:
-            print(f"[agent] rid={request_id} omni-plan attempt={attempt + 1} model={model} goal={goal!r}")
-
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **_model_params(model, 2000),
-                response_format={"type": "json_object"},
-            )
-
-            raw_text = response.choices[0].message.content or ""
-            print(f"[agent] rid={request_id} omni-plan raw response length={len(raw_text)}")
-
-            plan_dict = _extract_json(raw_text)
-            plan = OmniPlanResponse.model_validate(plan_dict)
-
-            print(f"[agent] rid={request_id} omni-plan validated: {len(plan.steps)} steps")
-            return plan
-
-        except AgentError:
-            raise
-        except json.JSONDecodeError as e:
-            last_error = AgentError(f"Invalid JSON from OmniParser model: {e}")
-            print(f"[agent] rid={request_id} omni-plan attempt={attempt + 1} JSON parse error: {e}")
-        except Exception as e:
-            last_error = AgentError(f"OmniParser model call failed: {type(e).__name__}: {e}")
-            print(f"[agent] rid={request_id} omni-plan attempt={attempt + 1} error: {type(e).__name__}: {e}")
-
-    raise last_error or AgentError("Unknown OmniParser plan failure")
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 2000),
+        request_id, "omni-plan"
+    )
+    plan_dict = _extract_json(raw_text)
+    plan = OmniPlanResponse.model_validate(plan_dict)
+    print(f"[agent] rid={request_id} omni-plan validated: {len(plan.steps)} steps")
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -796,7 +799,8 @@ async def generate_omniparser_refine(
 
     crop_b64 = base64.b64encode(crop_image_bytes).decode("utf-8")
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    # Use the fast model for refine — simple element-picking task
+    model = os.getenv("OPENAI_NEXT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o"))
     messages = [
         {
             "role": "user",
@@ -813,43 +817,20 @@ async def generate_omniparser_refine(
         }
     ]
 
-    last_error: Exception | None = None
+    raw_text = await _call_llm_with_backoff(
+        client, model, messages, _model_params(model, 500),
+        request_id, "omni-refine"
+    )
+    result = _extract_json(raw_text)
 
-    for attempt in range(1 + MAX_RETRIES):
-        try:
-            print(f"[agent] rid={request_id} omni-refine attempt={attempt + 1} model={model}")
+    # Normalize element_ids
+    if "element_ids" in result and isinstance(result["element_ids"], list):
+        ids = result["element_ids"]
+    elif "element_id" in result:
+        ids = [result["element_id"]]
+        result["element_ids"] = ids
+    else:
+        raise AgentError("omni-refine response missing element_ids")
 
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **_model_params(model, 500),
-                response_format={"type": "json_object"},
-            )
-
-            raw_text = response.choices[0].message.content or ""
-            print(f"[agent] rid={request_id} omni-refine raw response length={len(raw_text)}")
-
-            result = _extract_json(raw_text)
-
-            # Normalize element_ids
-            if "element_ids" in result and isinstance(result["element_ids"], list):
-                ids = result["element_ids"]
-            elif "element_id" in result:
-                ids = [result["element_id"]]
-                result["element_ids"] = ids
-            else:
-                raise AgentError("omni-refine response missing element_ids")
-
-            print(f"[agent] rid={request_id} omni-refine picked element_ids={ids} conf={result.get('confidence')} label={result.get('label')!r}")
-            return result
-
-        except AgentError:
-            raise
-        except json.JSONDecodeError as e:
-            last_error = AgentError(f"Invalid JSON from omni-refine: {e}")
-            print(f"[agent] rid={request_id} omni-refine attempt={attempt + 1} JSON error: {e}")
-        except Exception as e:
-            last_error = AgentError(f"Omni-refine call failed: {type(e).__name__}: {e}")
-            print(f"[agent] rid={request_id} omni-refine attempt={attempt + 1} error: {e}")
-
-    raise last_error or AgentError("Unknown omni-refine failure")
+    print(f"[agent] rid={request_id} omni-refine picked element_ids={ids} conf={result.get('confidence')} label={result.get('label')!r}")
+    return result

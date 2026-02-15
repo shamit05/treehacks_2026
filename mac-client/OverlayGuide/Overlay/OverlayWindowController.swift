@@ -38,30 +38,35 @@ class OverlayWindowController {
 
         if window == nil {
             window = createPanel()
+            // Position near cursor only when first created
+            let mouse = NSEvent.mouseLocation
+            if let screen = screenContaining(point: mouse) {
+                let origin = popupOrigin(near: mouse, in: screen.visibleFrame)
+                window!.setFrameOrigin(origin)
+            }
+            // Set SwiftUI content view once — it observes stateMachine via @ObservedObject
+            let hostingView = NSHostingView(
+                rootView: OverlayContentView(stateMachine: stateMachine)
+            )
+            hostingView.wantsLayer = true
+            hostingView.layer?.cornerRadius = 20
+            hostingView.layer?.masksToBounds = true
+            window!.contentView = hostingView
         }
         guard let window else { return }
 
-        // Reposition near cursor on every show request.
-        let mouse = NSEvent.mouseLocation
-        if let screen = screenContaining(point: mouse) {
-            let origin = popupOrigin(near: mouse, in: screen.visibleFrame)
-            window.setFrameOrigin(origin)
-        }
-
-        let hostingView = NSHostingView(
-            rootView: OverlayContentView(stateMachine: stateMachine)
-        )
-        hostingView.wantsLayer = true
-        hostingView.layer?.cornerRadius = 20
-        hostingView.layer?.masksToBounds = true
-        window.contentView = hostingView
         applyInteraction(for: phase, panel: window)
         updateHighlightPanels(for: phase)
     }
 
-    /// Remove popup panel.
+    /// Hide all overlay panels. Keeps the window alive so SwiftUI state is preserved.
     func hideAll() {
         window?.orderOut(nil)
+        hideHighlightPanels()
+    }
+
+    /// Fully destroy all panels (called on app quit).
+    func destroyAll() {
         window?.close()
         window = nil
         hideHighlightPanels()

@@ -211,9 +211,27 @@ class GlobalInputMonitor {
 
     // MARK: - Mouse Click Detection
 
+    /// Write debug info to a file (since print() is lost when launched via `open`)
+    private static func debugLog(_ msg: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+        if let data = line.data(using: .utf8) {
+            let url = URL(fileURLWithPath: "/tmp/overlayguide_clicks.log")
+            if let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
     private func startMouseTap() {
-        guard AXIsProcessTrusted() else {
-            print("[InputMonitor] Accessibility permission required for click detection. Grant access in System Settings > Privacy & Security > Accessibility.")
+        let trusted = AXIsProcessTrusted()
+        Self.debugLog("startMouseTap: AXIsProcessTrusted=\(trusted)")
+        guard trusted else {
+            Self.debugLog("ERROR: Accessibility permission NOT granted. Click detection disabled.")
+            print("[InputMonitor] Accessibility permission required for click detection.")
             return
         }
 
@@ -229,15 +247,19 @@ class GlobalInputMonitor {
                 guard let refcon = refcon else { return Unmanaged.passRetained(event) }
                 let monitor = Unmanaged<GlobalInputMonitor>.fromOpaque(refcon).takeUnretainedValue()
                 let location = event.location
+                GlobalInputMonitor.debugLog("CLICK at (\(location.x), \(location.y)) phase=\(monitor.stateMachine.phase)")
                 DispatchQueue.main.async {
                     if case .guiding = monitor.stateMachine.phase {
                         monitor.stateMachine.handleClick(at: location)
+                    } else {
+                        GlobalInputMonitor.debugLog("  -> ignored (not in .guiding phase)")
                     }
                 }
                 return Unmanaged.passRetained(event)
             },
             userInfo: selfPtr
         ) else {
+            Self.debugLog("ERROR: Failed to create event tap")
             print("[InputMonitor] Failed to create event tap. Check Accessibility permission.")
             return
         }
@@ -246,6 +268,7 @@ class GlobalInputMonitor {
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        Self.debugLog("Event tap created and enabled successfully")
     }
 
     private func stopMouseTap() {

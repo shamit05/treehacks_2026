@@ -243,8 +243,20 @@ class GuidanceStateMachine: ObservableObject {
             return
         }
 
+        // File-based debug log (print() is lost when launched via `open`)
+        let debugMsg = "[Click] screen=(\(format(point.x)),\(format(point.y))) norm=(\(format(normalizedClick.x)),\(format(normalizedClick.y))) bounds=\(rectString(screenBounds)) targets=\(step.targets.map { "(\(format($0.x ?? -1)),\(format($0.y ?? -1)),\(format($0.w ?? -1)),\(format($0.h ?? -1)))" })"
         if coordinateDebugEnabled {
-            print("[CoordsDebug] click screen=(\(format(point.x)), \(format(point.y))) normalized=(\(format(normalizedClick.x)), \(format(normalizedClick.y))) bounds=\(rectString(screenBounds))")
+            print(debugMsg)
+        }
+        if let data = (debugMsg + "\n").data(using: .utf8) {
+            let url = URL(fileURLWithPath: "/tmp/overlayguide_clicks.log")
+            if let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            } else {
+                try? data.write(to: url)
+            }
         }
 
         let hitTarget = step.targets.first { target in
