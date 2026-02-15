@@ -41,6 +41,11 @@ SCHEMA:
   ]
 }
 
+WEB SEARCH CONTEXT:
+The following information was gathered from the web during the initial plan. Use it to produce MORE ACCURATE bounding boxes and step instructions. If the search context is "none", ignore this section.
+
+{{SEARCH_CONTEXT}}
+
 BOUNDING BOX TIPS:
 - Target the specific button/field/link, not the whole toolbar or panel.
 - Ensure x+w <= 1.0 and y+h <= 1.0.

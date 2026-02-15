@@ -97,6 +97,7 @@ async def generate_plan(
     learning_profile: str | None = None,
     app_context: str | None = None,
     session_summary: str | None = None,
+    search_context: str | None = None,
     request_id: str = "",
 ) -> StepPlan:
     """
@@ -115,6 +116,7 @@ async def generate_plan(
     prompt = prompt.replace("{{LEARNING_PROFILE_TEXT}}", learning_profile or "default")
     prompt = prompt.replace("{{APP_CONTEXT_JSON}}", app_context or "{}")
     prompt = prompt.replace("{{SESSION_SUMMARY}}", session_summary or "none")
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
 
     # Encode screenshot
     screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
@@ -186,6 +188,7 @@ async def generate_replan(
     learning_profile: str | None = None,
     app_context: str | None = None,
     session_summary: str | None = None,
+    search_context: str | None = None,
     request_id: str = "",
 ) -> StepPlan:
     """
@@ -202,6 +205,7 @@ async def generate_replan(
     prompt = prompt.replace("{{LEARNING_PROFILE_TEXT}}", learning_profile or "default")
     prompt = prompt.replace("{{APP_CONTEXT_JSON}}", app_context or "{}")
     prompt = prompt.replace("{{SESSION_SUMMARY}}", session_summary or "none")
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
 
     screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
 
@@ -269,6 +273,7 @@ async def generate_next_step(
     total_steps: int,
     learning_profile: str | None = None,
     app_context: str | None = None,
+    search_context: str | None = None,
     request_id: str = "",
 ) -> StepPlan:
     """
@@ -285,6 +290,7 @@ async def generate_next_step(
     prompt = prompt.replace("{{TOTAL_STEPS}}", str(total_steps))
     prompt = prompt.replace("{{LEARNING_PROFILE_TEXT}}", learning_profile or "default")
     prompt = prompt.replace("{{APP_CONTEXT_JSON}}", app_context or "{}")
+    prompt = prompt.replace("{{SEARCH_CONTEXT}}", search_context or "none")
 
     screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
 

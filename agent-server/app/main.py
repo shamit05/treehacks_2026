@@ -25,10 +25,12 @@ async def lifespan(app: FastAPI):
     mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
     model = os.getenv("OPENAI_MODEL", "gpt-4o")
     has_key = bool(os.getenv("OPENAI_API_KEY"))
+    has_bd_key = bool(os.getenv("BRIGHTDATA_API_KEY"))
     print(f"[server] OverlayGuide Agent Server starting")
     print(f"[server]   MOCK_MODE={mock_mode}")
     print(f"[server]   OPENAI_MODEL={model}")
     print(f"[server]   OPENAI_API_KEY={'set' if has_key else 'MISSING'}")
+    print(f"[server]   BRIGHTDATA_API_KEY={'set' if has_bd_key else 'MISSING (web search disabled)'}")
     if not mock_mode and not has_key:
         print("[server]   WARNING: No API key set and mock mode is off. /plan will fail.")
     yield

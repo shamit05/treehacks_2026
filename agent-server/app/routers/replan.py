@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from app.schemas.step_plan import ImageSize, StepPlan
 from app.services.agent import AgentError, generate_replan
 from app.services.mock import get_mock_plan
+from app.services.search import get_stored_search_context
 
 router = APIRouter()
 
@@ -60,6 +61,11 @@ async def create_replan(
     if len(screenshot_bytes) == 0:
         raise HTTPException(status_code=422, detail="Screenshot file is empty")
 
+    # --- Retrieve stored search context from /plan call ---
+    search_context = get_stored_search_context(goal)
+    if search_context:
+        print(f"[replan] rid={request_id} using {len(search_context)} chars of stored search context")
+
     # --- Generate revised plan ---
     try:
         plan = await generate_replan(
@@ -70,6 +76,7 @@ async def create_replan(
             learning_profile=learning_profile,
             app_context=app_context,
             session_summary=session_summary,
+            search_context=search_context or None,
             request_id=request_id,
         )
     except AgentError as e:

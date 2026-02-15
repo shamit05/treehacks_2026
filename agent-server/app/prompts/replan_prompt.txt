@@ -25,6 +25,11 @@ HARD RULES:
 LEARNING PROFILE:
 The user's learning preference is: {{LEARNING_PROFILE_TEXT}}
 
+WEB SEARCH CONTEXT:
+The following information was gathered from the web during the initial plan. Use it to produce MORE ACCURATE bounding boxes and step instructions. If the search context is "none", ignore this section.
+
+{{SEARCH_CONTEXT}}
+
 CONTEXT:
 - goal: {{GOAL}}
 - current_step_id: {{CURRENT_STEP_ID}}

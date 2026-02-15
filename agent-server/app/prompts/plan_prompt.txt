@@ -92,6 +92,11 @@ EXAMPLE OUTPUT (for a hypothetical "send an email" task):
   ]
 }
 
+WEB SEARCH CONTEXT:
+The following information was gathered from the web to help you understand the current software version, relevant menus, settings, or workflows. Use it to produce MORE ACCURATE bounding boxes and step instructions. If the search context is "none", ignore this section.
+
+{{SEARCH_CONTEXT}}
+
 BOUNDING BOX TIPS:
 - Buttons: rect should cover just the button, not the surrounding whitespace.
 - Menu items: rect should cover the menu item text row only.

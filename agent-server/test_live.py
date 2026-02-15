@@ -12,9 +12,11 @@ Usage:
     #
     # 2. Run this script:
     #    python test_live.py
-    #    python test_live.py "Open System Settings and go to Wi-Fi"
+    #    python test_live.py --goal "Open System Settings and go to Wi-Fi"
+    #    python test_live.py --goal "Enable dark mode" --skip-search
 """
 
+import argparse
 import subprocess
 import sys
 import tempfile
@@ -65,7 +67,7 @@ def take_screenshot() -> tuple[bytes, int, int]:
     return png_bytes, 1920, 1080
 
 
-def test_plan(goal: str) -> dict | None:
+def test_plan(goal: str, skip_search: bool = False) -> dict | None:
     """Send a screenshot + goal to POST /plan and print the result."""
     print(f"\n{'='*60}")
     print(f"  GOAL: {goal}")
@@ -92,14 +94,17 @@ def test_plan(goal: str) -> dict | None:
     print(f"  Captured: {len(png_bytes):,} bytes, {w}x{h} ({elapsed}ms)")
 
     # Send to /plan
-    print("[3/3] Sending to /plan...")
+    print(f"[3/3] Sending to /plan (skip_search={skip_search})...")
     start = time.time()
+    form_data = {
+        "goal": goal,
+        "image_size": f'{{"w":{w},"h":{h}}}',
+    }
+    if skip_search:
+        form_data["skip_search"] = "true"
     resp = httpx.post(
         f"{SERVER_URL}/plan",
-        data={
-            "goal": goal,
-            "image_size": f'{{"w":{w},"h":{h}}}',
-        },
+        data=form_data,
         files={
             "screenshot": ("screenshot.png", png_bytes, "image/png"),
         },
@@ -191,13 +196,13 @@ def print_plan(plan: dict, label: str = "PLAN"):
 
 
 if __name__ == "__main__":
-    goal = DEFAULT_GOAL
-    args = sys.argv[1:]
-    if args:
-        goal = " ".join(args)
+    parser = argparse.ArgumentParser(description="Live test for the OverlayGuide agent server.")
+    parser.add_argument("--goal", "-g", type=str, default=DEFAULT_GOAL, help="Goal to send to /plan")
+    parser.add_argument("--skip-search", "-S", action="store_true", help="Disable web search for this request")
+    args = parser.parse_args()
 
-    plan = test_plan(goal)
-    test_next_step(goal, plan)
+    plan = test_plan(args.goal, skip_search=args.skip_search)
+    test_next_step(args.goal, plan)
 
     print("=" * 60)
     print("  All tests passed!")

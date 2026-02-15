@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from app.schemas.step_plan import ImageSize, StepPlan
 from app.services.agent import AgentError, generate_next_step
 from app.services.mock import get_mock_next_step
+from app.services.search import get_stored_search_context
 
 router = APIRouter()
 
@@ -71,6 +72,11 @@ async def next_step(
     if len(screenshot_bytes) == 0:
         raise HTTPException(status_code=422, detail="Screenshot file is empty")
 
+    # --- Retrieve stored search context from /plan call ---
+    search_context = get_stored_search_context(goal)
+    if search_context:
+        print(f"[next] rid={request_id} using {len(search_context)} chars of stored search context")
+
     # --- Generate next step(s) via AI ---
     try:
         plan = await generate_next_step(
@@ -81,6 +87,7 @@ async def next_step(
             total_steps=total_steps,
             learning_profile=learning_profile,
             app_context=app_context,
+            search_context=search_context or None,
             request_id=request_id,
         )
     except AgentError as e:

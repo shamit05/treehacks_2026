@@ -5,6 +5,7 @@
 # Receives a goal + screenshot, returns a StepPlan JSON.
 # Supports MOCK_MODE for demo reliability.
 
+import asyncio
 import json
 import os
 
@@ -13,6 +14,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from app.schemas.step_plan import ImageSize, StepPlan
 from app.services.agent import AgentError, generate_plan
 from app.services.mock import get_mock_plan
+from app.services.search import search_for_goal
 
 router = APIRouter()
 
@@ -28,6 +30,7 @@ async def create_plan(
     learning_profile: str = Form(None),
     app_context: str = Form(None),
     session_summary: str = Form(None),
+    skip_search: bool = Form(False),
 ):
     """
     Generate a step-by-step guidance plan from a goal and screenshot.
@@ -38,6 +41,7 @@ async def create_plan(
     - **learning_profile**: Optional learning style preference
     - **app_context**: Optional JSON string with app_name, bundle_id, window_title
     - **session_summary**: Optional short summary of recent session events
+    - **skip_search**: Optional flag to disable web search (default: false)
     """
     request_id = getattr(request.state, "request_id", "unknown")
     print(f"[plan] rid={request_id} goal={goal!r}")
@@ -64,17 +68,43 @@ async def create_plan(
 
     print(f"[plan] rid={request_id} screenshot={len(screenshot_bytes)} bytes, size={parsed_size.w}x{parsed_size.h}")
 
-    # --- Generate plan via AI ---
-    try:
-        plan = await generate_plan(
+    # --- Run search and plan generation CONCURRENTLY ---
+    # Search results are stored internally for /next and /replan calls.
+    # Plan generation proceeds without blocking on search, saving ~12-15s.
+    # Pass skip_search=true to disable web search entirely.
+
+    if skip_search:
+        print(f"[plan] rid={request_id} search skipped (skip_search=true)")
+
+    async def _safe_search() -> str:
+        """Wrapper so search failures don't cancel the gather."""
+        if skip_search:
+            return ""
+        try:
+            return await search_for_goal(
+                goal=goal,
+                screenshot_bytes=screenshot_bytes,
+                app_context=app_context,
+                request_id=request_id,
+            )
+        except Exception as e:
+            print(f"[plan] rid={request_id} search failed (non-fatal): {type(e).__name__}: {e}")
+            return ""
+
+    async def _generate() -> StepPlan:
+        return await generate_plan(
             goal=goal,
             image_size=parsed_size,
             screenshot_bytes=screenshot_bytes,
             learning_profile=learning_profile,
             app_context=app_context,
             session_summary=session_summary,
+            search_context="",  # plan starts without search; /next will use stored results
             request_id=request_id,
         )
+
+    try:
+        search_context, plan = await asyncio.gather(_safe_search(), _generate())
     except AgentError as e:
         print(f"[plan] rid={request_id} agent error: {e}")
         raise HTTPException(status_code=502, detail=f"Agent failed: {e}")
