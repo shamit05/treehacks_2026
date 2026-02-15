@@ -9,9 +9,11 @@ import SwiftUI
 struct GoalInputView: View {
     @ObservedObject var stateMachine: GuidanceStateMachine
     @State private var goalText: String = ""
+    @StateObject private var voiceInput = AppleVoiceInputService()
     @FocusState private var isFocused: Bool
     @State private var dragOffset: CGSize = .zero
     @State private var dragStartOffset: CGSize = .zero
+    @State private var voiceError: String?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -27,6 +29,14 @@ struct GoalInputView: View {
                         .foregroundColor(.primary)
                         .focused($isFocused)
                         .onSubmit { submitGoal() }
+
+                    Button(action: toggleVoiceInput) {
+                        Image(systemName: voiceInput.isListening ? "mic.fill" : "mic")
+                            .font(.system(size: 15, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(voiceInput.isListening ? .red : .secondary)
+                    .help(voiceInput.isListening ? "Stop voice input" : "Start voice input")
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 12)
@@ -48,6 +58,11 @@ struct GoalInputView: View {
 
                 HStack(spacing: 8) {
                     Spacer()
+                    if let voiceError {
+                        Text(voiceError)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.red)
+                    }
                     Keycap(text: "↩")
                     Text("to submit")
                         .font(.system(size: 13, weight: .medium))
@@ -82,12 +97,40 @@ struct GoalInputView: View {
                 isFocused = true
             }
         }
+        .onDisappear {
+            voiceInput.stopListening()
+        }
+        .onReceive(voiceInput.$transcript) { transcript in
+            guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            goalText = transcript
+        }
     }
 
     private func submitGoal() {
         let trimmed = goalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        voiceInput.stopListening()
         stateMachine.submitGoal(trimmed)
+    }
+
+    private func toggleVoiceInput() {
+        voiceError = nil
+        if voiceInput.isListening {
+            voiceInput.stopListening()
+            return
+        }
+        Task { @MainActor in
+            let granted = await voiceInput.requestPermissions()
+            guard granted else {
+                voiceError = "Enable microphone + speech permissions in System Settings."
+                return
+            }
+            do {
+                try voiceInput.startListening()
+            } catch {
+                voiceError = error.localizedDescription
+            }
+        }
     }
 }
 

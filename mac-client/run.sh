@@ -59,9 +59,22 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OverlayGuide listens to your voice so you can speak your goal instead of typing.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>OverlayGuide converts your speech to text to fill the goal input.</string>
 </dict>
 </plist>
 EOF
+fi
+
+# Ensure required privacy keys exist even for already-installed bundles.
+PLIST_BUDDY=/usr/libexec/PlistBuddy
+if ! "$PLIST_BUDDY" -c "Print :NSMicrophoneUsageDescription" "$CONTENTS/Info.plist" >/dev/null 2>&1; then
+  "$PLIST_BUDDY" -c "Add :NSMicrophoneUsageDescription string OverlayGuide listens to your voice so you can speak your goal instead of typing." "$CONTENTS/Info.plist"
+fi
+if ! "$PLIST_BUDDY" -c "Print :NSSpeechRecognitionUsageDescription" "$CONTENTS/Info.plist" >/dev/null 2>&1; then
+  "$PLIST_BUDDY" -c "Add :NSSpeechRecognitionUsageDescription string OverlayGuide converts your speech to text to fill the goal input." "$CONTENTS/Info.plist"
 fi
 
 choose_signing_identity() {
