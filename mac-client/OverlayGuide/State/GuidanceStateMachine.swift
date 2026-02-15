@@ -31,6 +31,8 @@ class GuidanceStateMachine: ObservableObject {
     @Published var hintMessage: String?
     @Published private(set) var completedSteps: [Step] = []
     @Published private(set) var capturedScreenBounds: CGRect?
+    @Published var completionMessage: String?
+    @Published var loadingStatus: String = "Processing screen..."
 
     // MARK: - Session
 
@@ -90,6 +92,10 @@ class GuidanceStateMachine: ObservableObject {
             do {
                 // Give the window system a brief moment to remove overlay windows.
                 try? await Task.sleep(nanoseconds: 150_000_000)
+
+                loadingStatus = "Capturing screen..."
+                self.phase = .loading
+
                 let screenshot = try await captureService.captureMainDisplay()
                 self.capturedScreenBounds = screenshot.screenBounds
                 let imgSize = ImageSize(
@@ -99,10 +105,16 @@ class GuidanceStateMachine: ObservableObject {
 
                 saveDebugArtifacts(goal: goal, screenshotData: screenshot.imageData)
 
-                // Show loading after screenshot is captured.
-                self.phase = .loading
+                loadingStatus = "Analyzing UI elements..."
 
-                // Send raw screenshot — server handles SoM markers + refinement
+                // Progressive status updates while waiting
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    if self.phase == .loading { self.loadingStatus = "Creating plan..." }
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    if self.phase == .loading { self.loadingStatus = "Generating overlays..." }
+                }
+
                 let plan = try await networkClient.requestPlan(
                     goal: goal,
                     screenshotData: screenshot.imageData,
@@ -130,14 +142,63 @@ class GuidanceStateMachine: ObservableObject {
     }
 
     /// External integration entry point for `/next` responses.
+    /// Handles status: "continue" (more steps), "done" (task complete), "retry" (try again).
+    func applyNextResponse(_ response: NextStepResponse) {
+        switch response.status {
+        case "done":
+            // Task is complete!
+            addEvent(.planReceived, detail: "done")
+            print("[State] Task complete: \(response.message ?? "done")")
+            completionMessage = response.message ?? "All done!"
+            phase = .completed
+
+        case "retry":
+            // Action didn't take effect — stay on current step
+            addEvent(.planReceived, detail: "retry")
+            print("[State] Retry: \(response.message ?? "try again")")
+            hintMessage = response.message ?? "That didn't seem to work. Try clicking the highlighted area again."
+            phase = .guiding
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                self.hintMessage = nil
+            }
+
+        default:
+            // "continue" — more steps to follow
+            guard !response.steps.isEmpty else {
+                // No steps but status is continue — treat as done
+                completionMessage = response.message ?? "All done!"
+                phase = .completed
+                return
+            }
+            let plan = StepPlan(
+                version: response.version,
+                goal: response.goal,
+                appContext: nil,
+                imageSize: response.imageSize,
+                steps: response.steps
+            )
+            currentPlan = plan
+            currentStepIndex = 0
+            session.stepPlan = plan
+            session.currentStepIndex = 0
+            addEvent(.planReceived, detail: "next")
+            logStepTargets(context: "next-plan")
+            phase = .guiding
+        }
+    }
+
+    /// Convenience: apply a StepPlan as a "continue" next response.
     func applyNextPlan(_ plan: StepPlan) {
-        currentPlan = plan
-        currentStepIndex = 0
-        session.stepPlan = plan
-        session.currentStepIndex = 0
-        addEvent(.planReceived, detail: "next")
-        logStepTargets(context: "next-plan")
-        phase = .guiding
+        let response = NextStepResponse(
+            version: plan.version,
+            goal: plan.goal,
+            status: "continue",
+            message: nil,
+            imageSize: plan.imageSize,
+            steps: plan.steps
+        )
+        applyNextResponse(response)
     }
 
     /// Debug integration helper: apply a raw JSON StepPlan payload from `/plan` or `/next`.
@@ -151,7 +212,11 @@ class GuidanceStateMachine: ObservableObject {
         }
     }
 
-    /// Handle a mouse click at screen coordinates
+    /// Handle a mouse click at screen coordinates.
+    /// NOTE: `point` comes from CGEvent.location which uses Quartz coordinates
+    /// (top-left origin, Y increases downward) — same convention as our
+    /// normalized [0,1] coordinates. capturedScreenBounds is from CGDisplayBounds
+    /// which is also Quartz. So we normalize directly WITHOUT flipping Y.
     func handleClick(at point: CGPoint) {
         guard phase == .guiding,
               let plan = currentPlan,
@@ -160,7 +225,15 @@ class GuidanceStateMachine: ObservableObject {
         let step = plan.steps[currentStepIndex]
         let screenBounds = capturedScreenBounds ?? NSScreen.main?.frame
         guard let screenBounds else { return }
-        guard screenBounds.contains(point) else {
+
+        // Normalize CGEvent point (Quartz top-left origin) to [0,1] (also top-left origin).
+        // Both coordinate systems use top-left origin, so NO Y-flip needed.
+        let normX = (point.x - screenBounds.origin.x) / screenBounds.width
+        let normY = (point.y - screenBounds.origin.y) / screenBounds.height
+        let normalizedClick = CGPoint(x: normX, y: normY)
+
+        // Check bounds (allow small margin outside [0,1] for edge clicks)
+        guard normX >= -0.02 && normX <= 1.02 && normY >= -0.02 && normY <= 1.02 else {
             addEvent(.clickMiss)
             hintMessage = "Try clicking the highlighted area"
             Task { @MainActor in
@@ -170,11 +243,6 @@ class GuidanceStateMachine: ObservableObject {
             return
         }
 
-        let mapper = CoordinateMapper(
-            screenBounds: screenBounds,
-            scaleFactor: NSScreen.main?.backingScaleFactor ?? 1.0
-        )
-        let normalizedClick = mapper.screenToNormalized(point)
         if coordinateDebugEnabled {
             print("[CoordsDebug] click screen=(\(format(point.x)), \(format(point.y))) normalized=(\(format(normalizedClick.x)), \(format(normalizedClick.y))) bounds=\(rectString(screenBounds))")
         }
@@ -206,6 +274,7 @@ class GuidanceStateMachine: ObservableObject {
         addEvent(.clickHit)
         addEvent(.stepAdvanced)
 
+        loadingStatus = "Processing next step..."
         phase = .loading
 
         Task { @MainActor in
@@ -217,7 +286,7 @@ class GuidanceStateMachine: ObservableObject {
                     h: Int(screenshot.screenBounds.height)
                 )
 
-                let nextPlan = try await networkClient.requestNext(
+                let nextResponse = try await networkClient.requestNext(
                     goal: session.goal,
                     screenshotData: screenshot.imageData,
                     imageSize: imgSize,
@@ -226,7 +295,7 @@ class GuidanceStateMachine: ObservableObject {
                     learningProfile: session.learningProfile,
                     appContext: session.appContext
                 )
-                applyNextPlan(nextPlan)
+                applyNextResponse(nextResponse)
             } catch {
                 // Fallback to local step progression
                 phase = .guiding
@@ -259,6 +328,7 @@ class GuidanceStateMachine: ObservableObject {
         currentPlan = nil
         currentStepIndex = 0
         hintMessage = nil
+        completionMessage = nil
         capturedScreenBounds = nil
         completedSteps = []
         session = SessionSnapshot(

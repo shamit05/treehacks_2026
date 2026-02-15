@@ -78,7 +78,7 @@ class AgentNetworkClient {
         totalSteps: Int,
         learningProfile: LearningProfile? = nil,
         appContext: AppContext? = nil
-    ) async throws -> StepPlan {
+    ) async throws -> NextStepResponse {
         let url = baseURL.appendingPathComponent("next")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -117,8 +117,8 @@ class AgentNetworkClient {
         request.httpBody = body
 
         let data = try await sendWithRetry(request: request, maxRetries: 1)
-        let plan = try JSONDecoder().decode(StepPlan.self, from: data)
-        return plan
+        let response = try JSONDecoder().decode(NextStepResponse.self, from: data)
+        return response
     }
 
     // MARK: - Private

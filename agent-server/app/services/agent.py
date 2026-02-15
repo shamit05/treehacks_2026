@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 from app.schemas.step_plan import (
     BBoxNorm,
     ImageSize,
+    NextStepResponse,
     OmniPlanResponse,
     RefineResponse,
     SoMStepPlan,
@@ -41,6 +42,9 @@ _SOM_REFINE_PROMPT_TEMPLATE = _SOM_REFINE_PROMPT_PATH.read_text()
 
 _OMNI_PLAN_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "omniparser_plan_prompt.txt"
 _OMNI_PLAN_PROMPT_TEMPLATE = _OMNI_PLAN_PROMPT_PATH.read_text()
+
+_OMNI_REFINE_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "omniparser_refine_prompt.txt"
+_OMNI_REFINE_PROMPT_TEMPLATE = _OMNI_REFINE_PROMPT_PATH.read_text()
 
 # ---------------------------------------------------------------------------
 # OpenAI client (lazy singleton)
@@ -375,10 +379,11 @@ async def generate_next_step(
     learning_profile: str | None = None,
     app_context: str | None = None,
     request_id: str = "",
-) -> StepPlan:
+) -> NextStepResponse:
     """
     Given a fresh screenshot after the user completed a step, identify
-    the next 1-2 actions. Returns a StepPlan with only those steps.
+    the next 1-2 actions. Returns a NextStepResponse with status
+    ("continue", "done", "retry") and optional steps.
     """
     client = _get_client()
 
@@ -427,10 +432,10 @@ async def generate_next_step(
             print(f"[agent] rid={request_id} next-step response length={len(raw_text)}")
 
             plan_dict = _extract_json(raw_text)
-            plan = StepPlan.model_validate(plan_dict)
+            result = NextStepResponse.model_validate(plan_dict)
 
-            print(f"[agent] rid={request_id} next-step validated: {len(plan.steps)} steps")
-            return plan
+            print(f"[agent] rid={request_id} next-step validated: status={result.status} steps={len(result.steps)} message={result.message!r}")
+            return result
 
         except AgentError:
             raise
@@ -763,3 +768,88 @@ async def generate_omniparser_plan(
             print(f"[agent] rid={request_id} omni-plan attempt={attempt + 1} error: {type(e).__name__}: {e}")
 
     raise last_error or AgentError("Unknown OmniParser plan failure")
+
+
+# ---------------------------------------------------------------------------
+# OmniParser refine: pick element from a zoomed crop
+# ---------------------------------------------------------------------------
+
+
+async def generate_omniparser_refine(
+    instruction: str,
+    target_label: str,
+    crop_image_bytes: bytes,
+    elements_context: str,
+    request_id: str = "",
+) -> dict:
+    """
+    Given a zoomed crop with OmniParser-detected elements, ask the LLM
+    to pick which element_id(s) match the target.
+    Returns dict with element_ids (list[int]), confidence, label.
+    """
+    client = _get_client()
+
+    prompt = _OMNI_REFINE_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{INSTRUCTION}}", instruction)
+    prompt = prompt.replace("{{TARGET_LABEL}}", target_label or "")
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context)
+
+    crop_b64 = base64.b64encode(crop_image_bytes).decode("utf-8")
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{crop_b64}",
+                        "detail": "high",
+                    },
+                },
+            ],
+        }
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            print(f"[agent] rid={request_id} omni-refine attempt={attempt + 1} model={model}")
+
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **_model_params(model, 500),
+                response_format={"type": "json_object"},
+            )
+
+            raw_text = response.choices[0].message.content or ""
+            print(f"[agent] rid={request_id} omni-refine raw response length={len(raw_text)}")
+
+            result = _extract_json(raw_text)
+
+            # Normalize element_ids
+            if "element_ids" in result and isinstance(result["element_ids"], list):
+                ids = result["element_ids"]
+            elif "element_id" in result:
+                ids = [result["element_id"]]
+                result["element_ids"] = ids
+            else:
+                raise AgentError("omni-refine response missing element_ids")
+
+            print(f"[agent] rid={request_id} omni-refine picked element_ids={ids} conf={result.get('confidence')} label={result.get('label')!r}")
+            return result
+
+        except AgentError:
+            raise
+        except json.JSONDecodeError as e:
+            last_error = AgentError(f"Invalid JSON from omni-refine: {e}")
+            print(f"[agent] rid={request_id} omni-refine attempt={attempt + 1} JSON error: {e}")
+        except Exception as e:
+            last_error = AgentError(f"Omni-refine call failed: {type(e).__name__}: {e}")
+            print(f"[agent] rid={request_id} omni-refine attempt={attempt + 1} error: {e}")
+
+    raise last_error or AgentError("Unknown omni-refine failure")

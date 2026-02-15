@@ -10,14 +10,14 @@ import os
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
-from app.schemas.step_plan import ImageSize, StepPlan
+from app.schemas.step_plan import ImageSize, NextStepResponse, StepPlan
 from app.services.agent import AgentError, generate_next_step
 from app.services.mock import get_mock_next_step
 
 router = APIRouter()
 
 
-@router.post("/next", response_model=StepPlan)
+@router.post("/next", response_model=NextStepResponse)
 async def next_step(
     request: Request,
     goal: str = Form(...),
@@ -90,5 +90,5 @@ async def next_step(
         print(f"[next] rid={request_id} unexpected error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
-    print(f"[next] rid={request_id} success, {len(plan.steps)} steps returned")
+    print(f"[next] rid={request_id} success: status={plan.status} steps={len(plan.steps)} message={plan.message!r}")
     return plan

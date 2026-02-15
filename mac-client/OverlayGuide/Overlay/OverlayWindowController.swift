@@ -126,7 +126,11 @@ class OverlayWindowController {
     }
 
     private func updateHighlightPanels(for phase: GuidancePhase) {
-        guard case .guiding = phase else {
+        // Show highlights during guiding AND loading (grayed out during loading)
+        switch phase {
+        case .guiding, .loading:
+            break
+        default:
             hideHighlightPanels()
             return
         }

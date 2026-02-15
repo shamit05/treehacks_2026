@@ -30,6 +30,7 @@ from app.schemas.step_plan import (
 from app.services.agent import (
     AgentError,
     generate_omniparser_plan,
+    generate_omniparser_refine,
     generate_plan,
     generate_som_plan,
     generate_som_refine,
@@ -38,6 +39,8 @@ from app.services.mock import get_mock_plan
 from app.services.omniparser import (
     OmniElement,
     OmniParserResult,
+    detect_elements,
+    draw_numbered_boxes,
     format_elements_context,
     parse_screenshot as omniparser_parse,
 )
@@ -46,12 +49,15 @@ router = APIRouter()
 
 MAX_SCREENSHOT_BYTES = 20 * 1024 * 1024  # 20 MB
 
-# SoM grid configuration
-SOM_COLUMNS = 16
-SOM_ROWS = 10
+# SoM grid configuration — coarse grid for hybrid pipeline.
+# 8x5 = 40 markers with big, easy-to-read numbers.
+SOM_COLUMNS = 8
+SOM_ROWS = 5
 
 # Default half-size of the bbox drawn around a marker center (normalized).
-_DEFAULT_MARKER_BBOX_HALF = 0.04
+# For the 8x5 grid: cells are 12.5% x 20%, so half-cell = 6.25% x 10%.
+# Use slightly smaller so bboxes don't overlap too much.
+_DEFAULT_MARKER_BBOX_HALF = 0.05
 
 
 def _generate_markers_and_image(
@@ -67,12 +73,12 @@ def _generate_markers_and_image(
     actual_w, actual_h = img.size
 
     # Scale marker size to image resolution.
-    # Target: markers should be ~1/80th of image width.
-    # On 3024px wide image: radius=38, font=24 — clearly readable.
-    # On 1512px wide image: radius=19, font=12 — still readable.
-    marker_radius = max(16, actual_w // 80)
-    font_size = max(12, actual_w // 120)
-    border_width = max(2, actual_w // 1000)
+    # With the coarse 8x5 grid we can use MUCH bigger markers.
+    # On 3024px wide image: radius=60, font=40 — very prominent.
+    # On 1512px wide image: radius=30, font=20 — clearly readable.
+    marker_radius = max(24, actual_w // 50)
+    font_size = max(16, actual_w // 75)
+    border_width = max(3, actual_w // 600)
 
     print(f"[plan] image={actual_w}x{actual_h}, marker_radius={marker_radius}, font_size={font_size}")
 
@@ -520,6 +526,179 @@ async def _refine_plan_two_pass(
     )
 
 
+# ---------------------------------------------------------------------------
+# Hybrid SOM + OmniParser refinement
+# ---------------------------------------------------------------------------
+
+# Padding around the coarse SOM target when cropping for OmniParser.
+# Smaller = tighter crop = fewer elements = more precise LLM pick.
+_OMNI_REFINE_PADDING = 0.04
+
+# Minimum crop size so YOLO has enough pixels to detect elements.
+_OMNI_MIN_CROP = 0.08
+
+
+def _crop_region(
+    original_bytes: bytes,
+    target_rect: TargetRect,
+) -> tuple[CropRect, bytes]:
+    """
+    Crop a region around the coarse target from the original screenshot.
+    Returns (crop_rect, cropped_png_bytes). No markers or boxes drawn.
+    """
+    img = Image.open(io.BytesIO(original_bytes))
+    actual_w, actual_h = img.size
+
+    pad = _OMNI_REFINE_PADDING
+    cx = max(0.0, target_rect.x - pad)
+    cy = max(0.0, target_rect.y - pad)
+    cw = min(target_rect.w + pad * 2, 1.0 - cx)
+    ch = min(target_rect.h + pad * 2, 1.0 - cy)
+
+    # Ensure minimum crop size
+    if cw < _OMNI_MIN_CROP:
+        center = cx + cw / 2
+        cx = max(0.0, center - _OMNI_MIN_CROP / 2)
+        cw = min(_OMNI_MIN_CROP, 1.0 - cx)
+    if ch < _OMNI_MIN_CROP:
+        center = cy + ch / 2
+        cy = max(0.0, center - _OMNI_MIN_CROP / 2)
+        ch = min(_OMNI_MIN_CROP, 1.0 - cy)
+
+    crop_rect = CropRect(cx=cx, cy=cy, cw=cw, ch=ch)
+
+    left = int(cx * actual_w)
+    top = int(cy * actual_h)
+    right = int((cx + cw) * actual_w)
+    bottom = int((cy + ch) * actual_h)
+    cropped = img.crop((left, top, right, bottom)).convert("RGB")
+
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return crop_rect, buf.getvalue()
+
+
+async def _refine_with_omniparser(
+    plan: StepPlan,
+    original_screenshot_bytes: bytes,
+    request_id: str,
+) -> StepPlan:
+    """
+    Hybrid SOM + OmniParser refinement.
+
+    For each step's coarse SOM target:
+      1. Crop the region from the original screenshot (generous padding).
+      2. Run YOLO on the crop to detect precise UI elements.
+      3. Draw numbered boxes on the crop.
+      4. Ask the LLM to pick which element is the target.
+      5. Map the crop-relative bbox back to full-image coordinates.
+    """
+    refined_steps: list[Step] = []
+
+    for step in plan.steps:
+        refined_targets: list[TargetRect] = []
+
+        for target in step.targets:
+            try:
+                # 1. Crop the region
+                crop_rect, crop_bytes = _crop_region(
+                    original_screenshot_bytes, target
+                )
+                print(f"[hybrid] rid={request_id} step={step.id} crop=({crop_rect.cx:.3f},{crop_rect.cy:.3f},{crop_rect.cw:.3f},{crop_rect.ch:.3f})")
+
+                # 2. Run YOLO on the crop
+                elements = detect_elements(crop_bytes)
+                print(f"[hybrid] rid={request_id} step={step.id} YOLO detected {len(elements)} elements in crop")
+
+                if not elements:
+                    print(f"[hybrid] rid={request_id} step={step.id} no elements in crop, keeping coarse bbox")
+                    refined_targets.append(target)
+                    continue
+
+                # 3. Draw numbered boxes on the crop
+                annotated_crop = draw_numbered_boxes(crop_bytes, elements)
+
+                # Save crop for debugging
+                try:
+                    with open(f"/tmp/overlayguide_hybrid_crop_{step.id}.png", "wb") as f:
+                        f.write(annotated_crop)
+                except Exception:
+                    pass
+
+                # 4. Ask LLM to pick the element
+                elements_ctx = format_elements_context(elements)
+                result = await generate_omniparser_refine(
+                    instruction=step.instruction,
+                    target_label=target.label or "",
+                    crop_image_bytes=annotated_crop,
+                    elements_context=elements_ctx,
+                    request_id=request_id,
+                )
+
+                picked_ids = result.get("element_ids", [])
+                elem_map = {e.id: e for e in elements}
+
+                # Find all valid elements
+                found = [elem_map[eid] for eid in picked_ids if eid in elem_map]
+                if not found:
+                    print(f"[hybrid] rid={request_id} step={step.id} no valid elements from {picked_ids}, keeping coarse bbox")
+                    refined_targets.append(target)
+                    continue
+
+                # 5. Compute bbox from selected elements and map to full-image coords
+                # Element bboxes are crop-relative [0,1] → convert to full-image [0,1]
+                all_x1 = [e.bbox_xyxy[0] for e in found]
+                all_y1 = [e.bbox_xyxy[1] for e in found]
+                all_x2 = [e.bbox_xyxy[2] for e in found]
+                all_y2 = [e.bbox_xyxy[3] for e in found]
+
+                # Crop-relative → full-image
+                full_x1 = crop_rect.cx + min(all_x1) * crop_rect.cw
+                full_y1 = crop_rect.cy + min(all_y1) * crop_rect.ch
+                full_x2 = crop_rect.cx + max(all_x2) * crop_rect.cw
+                full_y2 = crop_rect.cy + max(all_y2) * crop_rect.ch
+
+                # Clamp to [0,1]
+                rx = max(0.0, full_x1)
+                ry = max(0.0, full_y1)
+                rw = min(full_x2 - full_x1, 1.0 - rx)
+                rh = min(full_y2 - full_y1, 1.0 - ry)
+
+                # Ensure minimum size
+                rw = max(rw, 0.02)
+                rh = max(rh, 0.02)
+
+                refined = TargetRect(
+                    type=TargetType.bbox_norm,
+                    x=rx, y=ry, w=rw, h=rh,
+                    confidence=result.get("confidence"),
+                    label=result.get("label"),
+                )
+                ids_str = ",".join(str(i) for i in picked_ids)
+                print(f"[hybrid] rid={request_id} step={step.id} elements=[{ids_str}] ({len(found)} valid) -> bbox ({rx:.3f},{ry:.3f},{rw:.3f},{rh:.3f}) label={result.get('label')!r}")
+                refined_targets.append(refined)
+
+            except Exception as e:
+                print(f"[hybrid] rid={request_id} step={step.id} OmniParser refine failed: {e}, keeping coarse bbox")
+                refined_targets.append(target)
+
+        refined_steps.append(Step(
+            id=step.id,
+            instruction=step.instruction,
+            targets=refined_targets,
+            advance=step.advance,
+            safety=step.safety,
+        ))
+
+    return StepPlan(
+        version=plan.version,
+        goal=plan.goal,
+        app_context=plan.app_context,
+        image_size=plan.image_size,
+        steps=refined_steps,
+    )
+
+
 @router.post("/plan", response_model=StepPlan)
 async def create_plan(
     request: Request,
@@ -534,12 +713,12 @@ async def create_plan(
     """
     Generate a step-by-step guidance plan from a goal and screenshot.
 
-    OmniParser pipeline (default):
-      Screenshot → OmniParser (UI element detection) → LLM (step planning) → StepPlan
-      Controlled by USE_OMNIPARSER env var (default: "true").
+    Hybrid pipeline (default, USE_OMNIPARSER=true):
+      Screenshot → SOM coarse grid (8x5) → LLM picks region
+      → crop → OmniParser YOLO (precise elements) → LLM picks element → StepPlan
 
-    SoM pipeline (legacy, USE_OMNIPARSER=false):
-      Screenshot → grid markers → LLM → two-pass refinement → StepPlan
+    SoM-only pipeline (legacy, USE_OMNIPARSER=false):
+      Screenshot → SOM grid (8x5) → LLM → two-pass sub-grid refinement → StepPlan
     """
     request_id = getattr(request.state, "request_id", "unknown")
 
@@ -547,7 +726,7 @@ async def create_plan(
     # Legacy SoM fallback: only when OmniParser is disabled and markers_json != "none"
     use_som = not use_omniparser and markers_json != "none"
 
-    pipeline = "omniparser" if use_omniparser else ("som" if use_som else "legacy")
+    pipeline = "hybrid" if use_omniparser else ("som" if use_som else "legacy")
     print(f"[plan] rid={request_id} goal={goal!r} pipeline={pipeline}")
 
     # --- Parse and validate image_size ---
@@ -575,51 +754,46 @@ async def create_plan(
     # --- Generate plan via AI ---
     try:
         if use_omniparser:
-            # ----- OmniParser pipeline -----
-            # Step 1: Run OmniParser to detect UI elements
-            print(f"[plan] rid={request_id} running OmniParser element detection...")
-            omni_result = await omniparser_parse(
-                screenshot_bytes=screenshot_bytes,
-                request_id=request_id,
-            )
+            # ----- Hybrid SOM + OmniParser pipeline -----
+            # Pass 1: SOM coarse grid → LLM picks region per step
+            markers, marked_screenshot = _generate_markers_and_image(screenshot_bytes)
 
-            print(f"[plan] rid={request_id} OmniParser detected {len(omni_result.elements)} elements")
-            for elem in omni_result.elements:
-                x, y, w, h = elem.bbox_xywh
-                print(f"[plan] rid={request_id} ELEMENT [{elem.id}] {elem.type}: \"{elem.content}\" bbox=({x:.3f},{y:.3f},{w:.3f},{h:.3f})")
-
-            # Save annotated screenshot for debugging
             try:
-                with open("/tmp/overlayguide_omniparser_annotated.png", "wb") as f:
-                    f.write(omni_result.annotated_image_bytes)
+                with open("/tmp/overlayguide_hybrid_som.png", "wb") as f:
+                    f.write(marked_screenshot)
             except Exception:
                 pass
 
-            # Step 2: Format element list as context for LLM
-            elements_context = format_elements_context(omni_result.elements)
-
-            # Step 3: Ask LLM to select elements and generate plan
-            omni_plan = await generate_omniparser_plan(
+            som_plan = await generate_som_plan(
                 goal=goal,
                 image_size=parsed_size,
-                annotated_screenshot_bytes=omni_result.annotated_image_bytes,
-                elements_context=elements_context,
+                screenshot_bytes=marked_screenshot,
                 learning_profile=learning_profile,
                 app_context=app_context,
                 session_summary=session_summary,
                 request_id=request_id,
             )
 
-            # Log what the LLM picked
-            for step in omni_plan.steps:
-                print(f"[plan] rid={request_id} OMNI PICK: step={step.id} element_ids={step.element_ids} conf={step.confidence}")
+            # Log coarse picks
+            marker_map = {m.id: m for m in markers}
+            for step in som_plan.steps:
+                for st in step.som_targets:
+                    m = marker_map.get(st.marker_id)
+                    if m:
+                        print(f"[plan] rid={request_id} SOM COARSE: step={step.id} marker={st.marker_id} -> ({m.cx:.3f},{m.cy:.3f}) label={st.label!r}")
 
-            # Step 4: Convert element IDs → bounding box targets
-            plan = _omni_plan_to_step_plan(omni_plan, omni_result.elements)
+            coarse_plan = _som_plan_to_step_plan(som_plan, markers)
+
+            for step in coarse_plan.steps:
+                for t in step.targets:
+                    print(f"[plan] rid={request_id} COARSE TARGET: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
+
+            # Pass 2: For each step, crop → YOLO → LLM picks precise element
+            plan = await _refine_with_omniparser(coarse_plan, screenshot_bytes, request_id)
 
             for step in plan.steps:
                 for t in step.targets:
-                    print(f"[plan] rid={request_id} OMNI TARGET: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
+                    print(f"[plan] rid={request_id} HYBRID FINAL: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
 
         elif use_som:
             # ----- SoM pipeline (legacy) -----

@@ -118,7 +118,7 @@ def _get_yolo_model():
     return _yolo_model
 
 
-def _detect_with_yolo(
+def detect_elements(
     screenshot_bytes: bytes,
     box_threshold: float = 0.05,
     iou_threshold: float = 0.1,
@@ -184,7 +184,7 @@ def _detect_with_yolo(
 # ---------------------------------------------------------------------------
 
 
-def _draw_numbered_boxes(
+def draw_numbered_boxes(
     screenshot_bytes: bytes,
     elements: list[OmniElement],
 ) -> bytes:
@@ -271,7 +271,7 @@ async def parse_screenshot(
 
     # Try local YOLO detection
     try:
-        elements = _detect_with_yolo(
+        elements = detect_elements(
             screenshot_bytes,
             box_threshold=box_threshold,
             iou_threshold=iou_threshold,
@@ -294,7 +294,7 @@ async def parse_screenshot(
         print(f"[omniparser] rid={request_id} WARNING: no elements detected")
 
     # Draw numbered boxes on the screenshot
-    annotated_bytes = _draw_numbered_boxes(screenshot_bytes, elements)
+    annotated_bytes = draw_numbered_boxes(screenshot_bytes, elements)
 
     # Save annotated image for debugging
     try:

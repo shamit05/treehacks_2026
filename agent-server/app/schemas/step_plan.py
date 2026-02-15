@@ -273,3 +273,24 @@ class StepPlan(BaseModel):
     steps: list[Step] = Field(..., min_length=1, max_length=10)
 
     model_config = {"extra": "forbid"}
+
+
+class NextStepResponse(BaseModel):
+    """
+    Response from the /next endpoint. Extends StepPlan with a status field
+    so the server can signal completion or request a retry.
+
+    status values:
+      - "continue": more steps to follow (steps will be non-empty)
+      - "done": the task is complete (steps may be empty)
+      - "retry": the previous action didn't take effect, try again (steps may be empty)
+    """
+
+    version: str = Field(default="v1", pattern=r"^v\d+$")
+    goal: str = Field(..., min_length=1)
+    status: str = Field(default="continue", pattern=r"^(continue|done|retry)$")
+    message: Optional[str] = Field(None, description="Human-readable status message")
+    image_size: ImageSize
+    steps: list[Step] = Field(default_factory=list, max_length=10)
+
+    model_config = {"extra": "forbid"}

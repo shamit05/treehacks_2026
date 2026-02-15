@@ -192,25 +192,14 @@ def test_plan(goal: str, use_som: bool = True) -> dict | None:
     elapsed = round((time.time() - start) * 1000)
     print(f"  Captured: {len(png_bytes):,} bytes, {w}x{h} ({elapsed}ms)")
 
-    # Generate markers (SoM mode)
-    markers_json_str = None
+    # The server handles all marker generation now (hybrid SOM + OmniParser).
+    # Just send the raw screenshot — no client-side markers needed.
     screenshot_to_send = png_bytes
 
     if use_som:
-        print("[3/4] Generating SoM markers...")
-        start = time.time()
-        markers = generate_markers(w, h)
-        marked_png = draw_markers_on_image(png_bytes, markers, w, h)
-        markers_json_str = json.dumps(markers)
-        screenshot_to_send = marked_png
-        elapsed = round((time.time() - start) * 1000)
-        print(f"  Generated {len(markers)} markers, marked image: {len(marked_png):,} bytes ({elapsed}ms)")
-
-        # Save debug artifacts
-        Path("/tmp/overlayguide_test_marked.png").write_bytes(marked_png)
-        print("  Saved marked screenshot to /tmp/overlayguide_test_marked.png")
+        print("[3/4] Server-side SOM — sending raw screenshot (server draws markers)")
     else:
-        print("[3/4] Skipping marker generation (legacy mode)")
+        print("[3/4] Legacy mode — sending raw screenshot")
 
     # Send to /plan
     print("[4/4] Sending to /plan...")
@@ -220,8 +209,6 @@ def test_plan(goal: str, use_som: bool = True) -> dict | None:
         "goal": goal,
         "image_size": f'{{"w":{w},"h":{h}}}',
     }
-    if markers_json_str:
-        form_data["markers_json"] = markers_json_str
 
     resp = httpx.post(
         f"{SERVER_URL}/plan",

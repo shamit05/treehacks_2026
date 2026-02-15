@@ -30,7 +30,7 @@ class GlobalInputMonitor {
     private static let hotkeySecondaryID: UInt32 = 2
     private static let primaryKeyCode: UInt16 = 31   // kVK_ANSI_O
     private static let primaryModifiers: UInt32 = UInt32(cmdKey | optionKey)
-    private static let secondaryKeyCode: UInt16 = 5  // kVK_ANSI_G
+    private static let secondaryKeyCode: UInt16 = 31 // kVK_ANSI_O (Cmd+Shift+O)
     private static let secondaryModifiers: UInt32 = UInt32(cmdKey | shiftKey)
 
     init(stateMachine: GuidanceStateMachine) {
@@ -43,13 +43,15 @@ class GlobalInputMonitor {
         registerHotkey()
         registerFallbackGlobalKeyMonitor()
         startMouseTap()
-        print("[InputMonitor] Started. Hotkeys: Cmd+Option+O or Cmd+Shift+G.")
+        registerEscapeMonitor()
+        print("[InputMonitor] Started. Hotkeys: Cmd+Option+O or Cmd+Shift+O. Escape to dismiss.")
     }
 
     func stop() {
         stopMouseTap()
         unregisterHotkey()
         unregisterFallbackGlobalKeyMonitor()
+        unregisterEscapeMonitor()
         print("[InputMonitor] Stopped.")
     }
 
@@ -150,6 +152,51 @@ class GlobalInputMonitor {
             NSEvent.removeMonitor(globalKeyMonitor)
             self.globalKeyMonitor = nil
         }
+    }
+
+    // MARK: - Escape Key (always dismisses)
+
+    private var escapeMonitor: Any?
+    private var localEscapeMonitor: Any?
+
+    private func registerEscapeMonitor() {
+        // Global monitor (when OverlayGuide is not focused)
+        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53 { // kVK_Escape
+                DispatchQueue.main.async {
+                    self?.handleEscape()
+                }
+            }
+        }
+        // Local monitor (when OverlayGuide panel is focused)
+        localEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53 { // kVK_Escape
+                DispatchQueue.main.async {
+                    self?.handleEscape()
+                }
+                return nil // consume the event
+            }
+            return event
+        }
+    }
+
+    private func unregisterEscapeMonitor() {
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+            self.escapeMonitor = nil
+        }
+        if let localEscapeMonitor {
+            NSEvent.removeMonitor(localEscapeMonitor)
+            self.localEscapeMonitor = nil
+        }
+    }
+
+    private func handleEscape() {
+        // Escape always resets the overlay, regardless of current phase
+        let phase = stateMachine.phase
+        guard phase != .idle else { return }
+        print("[InputMonitor] Escape pressed — resetting from phase: \(phase)")
+        stateMachine.reset()
     }
 
     private func triggerHotkey() {

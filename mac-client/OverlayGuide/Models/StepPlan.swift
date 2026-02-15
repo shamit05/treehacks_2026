@@ -23,6 +23,24 @@ struct StepPlan: Codable, Equatable {
     }
 }
 
+// MARK: - NextStepResponse
+
+/// Response from the /next endpoint. Includes a status field
+/// so the server can signal completion or request a retry.
+struct NextStepResponse: Codable, Equatable {
+    let version: String
+    let goal: String
+    let status: String          // "continue", "done", "retry"
+    let message: String?        // Human-readable status message
+    let imageSize: ImageSize
+    let steps: [Step]           // May be empty when status is "done" or "retry"
+
+    enum CodingKeys: String, CodingKey {
+        case version, goal, status, message, steps
+        case imageSize = "image_size"
+    }
+}
+
 // MARK: - AppContext
 
 struct AppContext: Codable, Equatable {
