@@ -11,6 +11,7 @@ import Foundation
 struct ScreenshotResult {
     let image: NSImage
     let imageData: Data        // PNG data for sending to the agent
+    let displayID: CGDirectDisplayID
     let screenBounds: CGRect
     let scaleFactor: CGFloat
     let timestamp: Date
@@ -44,16 +45,18 @@ class ScreenCaptureService {
     }
 
     private func performCapture() async throws -> ScreenshotResult {
-        guard let screen = NSScreen.main else {
-            throw CaptureError.noDisplay
-        }
-
         let displayId = CGMainDisplayID()
         guard let cgImage = CGDisplayCreateImage(displayId) else {
             throw CaptureError.captureFailed
         }
+        let displayBounds = CGDisplayBounds(displayId)
+        guard displayBounds.width > 0, displayBounds.height > 0 else {
+            throw CaptureError.noDisplay
+        }
 
-        let nsImage = NSImage(cgImage: cgImage, size: screen.frame.size)
+        let scaleFactor = self.scaleFactor(for: displayId)
+
+        let nsImage = NSImage(cgImage: cgImage, size: displayBounds.size)
 
         guard let tiffData = nsImage.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
@@ -64,10 +67,21 @@ class ScreenCaptureService {
         return ScreenshotResult(
             image: nsImage,
             imageData: pngData,
-            screenBounds: screen.frame,
-            scaleFactor: screen.backingScaleFactor,
+            displayID: displayId,
+            screenBounds: displayBounds,
+            scaleFactor: scaleFactor,
             timestamp: Date()
         )
+    }
+
+    private func scaleFactor(for displayID: CGDirectDisplayID) -> CGFloat {
+        for screen in NSScreen.screens {
+            if let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+               CGDirectDisplayID(num.uint32Value) == displayID {
+                return screen.backingScaleFactor
+            }
+        }
+        return 1.0
     }
 
     /// Check if Screen Recording permission is granted

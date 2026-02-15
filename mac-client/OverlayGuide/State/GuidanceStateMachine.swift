@@ -29,6 +29,7 @@ class GuidanceStateMachine: ObservableObject {
     @Published var currentStepIndex: Int = 0
     @Published var hintMessage: String?
     @Published private(set) var completedSteps: [Step] = []
+    @Published private(set) var capturedScreenBounds: CGRect?
 
     // MARK: - Session
 
@@ -40,6 +41,7 @@ class GuidanceStateMachine: ObservableObject {
     private let captureService: ScreenCaptureService
     private let lastGoalPath = "/tmp/overlayguide_last_goal.txt"
     private let lastScreenshotPath = "/tmp/overlayguide_last_screenshot.png"
+    private let coordinateDebugEnabled = true
 
     init(networkClient: AgentNetworkClient, captureService: ScreenCaptureService) {
         self.networkClient = networkClient
@@ -72,6 +74,7 @@ class GuidanceStateMachine: ObservableObject {
         currentPlan = nil
         currentStepIndex = 0
         hintMessage = nil
+        capturedScreenBounds = nil
         phase = .inputGoal
     }
 
@@ -87,6 +90,7 @@ class GuidanceStateMachine: ObservableObject {
                 // Give the window system a brief moment to remove overlay windows.
                 try? await Task.sleep(nanoseconds: 150_000_000)
                 let screenshot = try await captureService.captureMainDisplay()
+                self.capturedScreenBounds = screenshot.screenBounds
                 saveDebugArtifacts(goal: goal, screenshotData: screenshot.imageData)
                 // Show loading only after the screenshot is already captured.
                 self.phase = .loading
@@ -111,6 +115,7 @@ class GuidanceStateMachine: ObservableObject {
         session.stepPlan = plan
         session.currentStepIndex = 0
         addEvent(.planReceived)
+        logStepTargets(context: "initial-plan")
         phase = .guiding
     }
 
@@ -121,6 +126,7 @@ class GuidanceStateMachine: ObservableObject {
         session.stepPlan = plan
         session.currentStepIndex = 0
         addEvent(.planReceived, detail: "next")
+        logStepTargets(context: "next-plan")
         phase = .guiding
     }
 
@@ -142,15 +148,37 @@ class GuidanceStateMachine: ObservableObject {
               currentStepIndex < plan.steps.count else { return }
 
         let step = plan.steps[currentStepIndex]
-        guard let screen = NSScreen.main else { return }
+        let screenBounds = capturedScreenBounds ?? NSScreen.main?.frame
+        guard let screenBounds else { return }
+        guard screenBounds.contains(point) else {
+            addEvent(.clickMiss)
+            hintMessage = "Try clicking the highlighted area"
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                self.hintMessage = nil
+            }
+            return
+        }
 
         let mapper = CoordinateMapper(
-            screenBounds: screen.frame,
-            scaleFactor: screen.backingScaleFactor
+            screenBounds: screenBounds,
+            scaleFactor: NSScreen.main?.backingScaleFactor ?? 1.0
         )
+        let normalizedClick = mapper.screenToNormalized(point)
+        if coordinateDebugEnabled {
+            print("[CoordsDebug] click screen=(\(format(point.x)), \(format(point.y))) normalized=(\(format(normalizedClick.x)), \(format(normalizedClick.y))) bounds=\(rectString(screenBounds))")
+        }
+
+        if coordinateDebugEnabled {
+            for (idx, target) in step.targets.enumerated() {
+                let targetRect = mapper.normalizedToScreen(target)
+                let inside = normalizedPoint(normalizedClick, isInside: target)
+                print("[CoordsDebug] target[\(idx)] norm=(x:\(format(target.x)), y:\(format(target.y)), w:\(format(target.w)), h:\(format(target.h))) screen=\(rectString(targetRect)) hit=\(inside)")
+            }
+        }
 
         let hitTarget = step.targets.first { target in
-            mapper.isClick(point, insideTarget: target)
+            normalizedPoint(normalizedClick, isInside: target)
         }
 
         if hitTarget != nil {
@@ -185,6 +213,7 @@ class GuidanceStateMachine: ObservableObject {
                 // NOTE: we intentionally only trigger next-step refresh after a click completion,
                 // not hover or tooltip changes, to avoid false state-change detections.
                 let screenshot = try await captureService.captureMainDisplay()
+                self.capturedScreenBounds = screenshot.screenBounds
                 let nextPlan = try await networkClient.requestNext(
                     goal: session.goal,
                     screenshotData: screenshot.imageData,
@@ -230,6 +259,7 @@ class GuidanceStateMachine: ObservableObject {
         currentPlan = nil
         currentStepIndex = 0
         hintMessage = nil
+        capturedScreenBounds = nil
         completedSteps = []
         session = SessionSnapshot(
             sessionId: UUID(),
@@ -247,6 +277,41 @@ class GuidanceStateMachine: ObservableObject {
         if session.events.count > SessionSnapshot.maxEvents {
             session.events.removeFirst()
         }
+    }
+
+    private func normalizedPoint(_ point: CGPoint, isInside target: TargetRect) -> Bool {
+        let epsilon: CGFloat = 0.001
+        let minX = CGFloat(target.x) - epsilon
+        let minY = CGFloat(target.y) - epsilon
+        let maxX = CGFloat(target.x + target.w) + epsilon
+        let maxY = CGFloat(target.y + target.h) + epsilon
+        return point.x >= minX && point.x <= maxX && point.y >= minY && point.y <= maxY
+    }
+
+    private func logStepTargets(context: String) {
+        guard coordinateDebugEnabled else { return }
+        guard let plan = currentPlan, currentStepIndex < plan.steps.count else { return }
+        guard let screenBounds = capturedScreenBounds ?? NSScreen.main?.frame else { return }
+
+        let step = plan.steps[currentStepIndex]
+        let mapper = CoordinateMapper(screenBounds: screenBounds, scaleFactor: NSScreen.main?.backingScaleFactor ?? 1.0)
+        print("[CoordsDebug] \(context) step=\(currentStepIndex + 1)/\(plan.steps.count) bounds=\(rectString(screenBounds))")
+        for (idx, target) in step.targets.enumerated() {
+            let rect = mapper.normalizedToScreen(target)
+            print("[CoordsDebug] target[\(idx)] norm=(x:\(format(target.x)), y:\(format(target.y)), w:\(format(target.w)), h:\(format(target.h))) screen=\(rectString(rect))")
+        }
+    }
+
+    private func rectString(_ rect: CGRect) -> String {
+        "(x:\(format(rect.origin.x)), y:\(format(rect.origin.y)), w:\(format(rect.width)), h:\(format(rect.height)))"
+    }
+
+    private func format(_ value: CGFloat) -> String {
+        String(format: "%.3f", value)
+    }
+
+    private func format(_ value: Double) -> String {
+        String(format: "%.3f", value)
     }
 
     private func saveDebugArtifacts(goal: String, screenshotData: Data) {

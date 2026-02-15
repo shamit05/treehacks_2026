@@ -3,6 +3,7 @@
 //
 // SwiftUI content rendered inside the popup overlay window.
 
+import AppKit
 import SwiftUI
 
 struct OverlayContentView: View {
@@ -83,14 +84,14 @@ struct HighlightOverlayView: View {
     let screenBounds: CGRect
 
     var body: some View {
-        ZStack {
+        Group {
             if case .guiding = stateMachine.phase,
                let plan = stateMachine.currentPlan,
                stateMachine.currentStepIndex < plan.steps.count {
                 let step = plan.steps[stateMachine.currentStepIndex]
-                ForEach(Array(step.targets.enumerated()), id: \.offset) { _, target in
-                    HighlightRectOnScreen(target: target, screenBounds: screenBounds)
-                }
+                HighlightOverlayCanvas(targets: step.targets, screenBounds: screenBounds)
+            } else {
+                Color.clear
             }
         }
         .frame(width: screenBounds.width, height: screenBounds.height)
@@ -99,24 +100,54 @@ struct HighlightOverlayView: View {
     }
 }
 
-struct HighlightRectOnScreen: View {
-    let target: TargetRect
+private struct HighlightOverlayCanvas: NSViewRepresentable {
+    let targets: [TargetRect]
     let screenBounds: CGRect
 
-    var body: some View {
-        let x = target.x * screenBounds.width
-        let y = target.y * screenBounds.height
-        let w = target.w * screenBounds.width
-        let h = target.h * screenBounds.height
+    func makeNSView(context: Context) -> HighlightOverlayNSView {
+        let view = HighlightOverlayNSView()
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        return view
+    }
 
-        RoundedRectangle(cornerRadius: 8)
-            .fill(Color.blue.opacity(0.16))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.blue.opacity(0.95), lineWidth: 2.5)
-            )
-            .frame(width: w, height: h)
-            .position(x: x + w / 2, y: y + h / 2)
+    func updateNSView(_ nsView: HighlightOverlayNSView, context: Context) {
+        nsView.screenBounds = screenBounds
+        nsView.targets = targets
+    }
+}
+
+private final class HighlightOverlayNSView: NSView {
+    var targets: [TargetRect] = [] {
+        didSet { needsDisplay = true }
+    }
+    var screenBounds: CGRect = .zero {
+        didSet { needsDisplay = true }
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.clear.setFill()
+        dirtyRect.fill()
+        guard !targets.isEmpty, screenBounds.width > 0, screenBounds.height > 0 else { return }
+
+        let mapper = CoordinateMapper(screenBounds: screenBounds, scaleFactor: 1.0)
+        let fillColor = NSColor.systemBlue.withAlphaComponent(0.16)
+        let strokeColor = NSColor.systemBlue.withAlphaComponent(0.95)
+
+        for target in targets {
+            let screenRect = mapper.normalizedToScreen(target)
+            let localRect = screenRect.offsetBy(dx: -screenBounds.origin.x, dy: -screenBounds.origin.y)
+            let path = NSBezierPath(roundedRect: localRect, xRadius: 8, yRadius: 8)
+
+            fillColor.setFill()
+            path.fill()
+
+            strokeColor.setStroke()
+            path.lineWidth = 2.5
+            path.stroke()
+        }
     }
 }
 

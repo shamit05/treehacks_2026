@@ -14,10 +14,22 @@ struct GoalInputView: View {
     @State private var dragStartOffset: CGSize = .zero
 
     var body: some View {
-        VStack(spacing: 12) {
-            Capsule()
-                .fill(Color.secondary.opacity(0.5))
-                .frame(width: 36, height: 5)
+        VStack(spacing: 8) {
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(.secondary)
+
+                    TextField("Help me with ...", text: $goalText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 18, weight: .regular))
+                        .foregroundColor(.primary)
+                        .focused($isFocused)
+                        .onSubmit { submitGoal() }
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
                 .gesture(
                     DragGesture()
                         .onChanged { value in
@@ -31,46 +43,70 @@ struct GoalInputView: View {
                         }
                 )
 
-            Text("What do you need help with?")
-                .font(.title2)
-                .fontWeight(.semibold)
-                .foregroundColor(.primary)
+                Divider()
+                    .overlay(Color.secondary.opacity(0.35))
 
-            HStack {
-                TextField("e.g. Explain to me how to use the crop feature", text: $goalText)
-                    .textFieldStyle(.plain)
-                    .font(.body)
-                    .foregroundColor(.primary)
-                    .padding(12)
-                    .background(Color.primary.opacity(0.08))
-                    .cornerRadius(10)
-                    .focused($isFocused)
-                    .onSubmit {
-                        guard !goalText.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-                        stateMachine.submitGoal(goalText)
-                    }
-
-                Button(action: {
-                    guard !goalText.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-                    stateMachine.submitGoal(goalText)
-                }) {
-                    Image(systemName: "arrow.right.circle.fill")
-                        .font(.title2)
-                        .foregroundColor(.blue)
+                HStack(spacing: 8) {
+                    Spacer()
+                    Keycap(text: "↩")
+                    Text("to submit")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.secondary)
+                    Keycap(text: "esc")
+                        .padding(.leading, 10)
+                    Text("to cancel")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.secondary)
                 }
-                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.bottom, 18)
-        .padding(.top, 10)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20))
-        .frame(maxWidth: 500)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+        )
+        .padding(.horizontal, 6)
+        .padding(.top, 4)
+        .frame(maxWidth: 900)
         .offset(dragOffset)
+        .onExitCommand {
+            stateMachine.reset()
+        }
         .onAppear {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 isFocused = true
             }
         }
+    }
+
+    private func submitGoal() {
+        let trimmed = goalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        stateMachine.submitGoal(trimmed)
+    }
+}
+
+private struct Keycap: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.secondary.opacity(0.18))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+            )
     }
 }
