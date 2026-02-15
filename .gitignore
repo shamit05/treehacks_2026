@@ -78,3 +78,8 @@ ENV/
 *.log
 tmp/
 .cache/
+
+# =========================
+# Model weights (downloaded at runtime)
+# =========================
+agent-server/weights/

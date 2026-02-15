@@ -215,6 +215,35 @@ class SoMStepPlan(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# OmniParser-based plan models — LLM selects element IDs from OmniParser
+# ---------------------------------------------------------------------------
+
+
+class OmniPlanStep(BaseModel):
+    """A step as returned by the OmniParser planner (element IDs)."""
+
+    id: str = Field(..., min_length=1)
+    instruction: str = Field(..., min_length=1)
+    element_ids: list[int] = Field(..., min_length=1, description="OmniParser element IDs")
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    advance: Advance
+    safety: Optional[Safety] = None
+
+    model_config = {"extra": "forbid"}
+
+
+class OmniPlanResponse(BaseModel):
+    """Plan returned by the OmniParser planner — steps reference element IDs."""
+
+    version: str = Field(..., pattern=r"^v\d+$")
+    goal: str = Field(..., min_length=1)
+    image_size: ImageSize
+    steps: list[OmniPlanStep] = Field(..., min_length=1, max_length=10)
+
+    model_config = {"extra": "forbid"}
+
+
+# ---------------------------------------------------------------------------
 # Standard Step / StepPlan models (original API response format)
 # ---------------------------------------------------------------------------
 

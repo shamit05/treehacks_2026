@@ -4,8 +4,10 @@
 # POST /plan endpoint.
 # Receives a goal + screenshot, returns a StepPlan JSON.
 # Supports MOCK_MODE for demo reliability.
-# SoM pipeline: server generates markers and draws them on the screenshot
-# at actual pixel resolution (avoids Retina/AppKit coordinate issues).
+#
+# Pipeline options (controlled by USE_OMNIPARSER env var):
+#   OmniParser (default): screenshot → OmniParser → element list → LLM → StepPlan
+#   SoM (legacy):         screenshot → grid markers → LLM → two-pass refine → StepPlan
 
 import io
 import json
@@ -17,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 from app.schemas.step_plan import (
     CropRect,
     ImageSize,
+    OmniPlanResponse,
     SoMMarker,
     SoMStepPlan,
     Step,
@@ -24,8 +27,20 @@ from app.schemas.step_plan import (
     TargetRect,
     TargetType,
 )
-from app.services.agent import AgentError, generate_plan, generate_som_plan, generate_som_refine
+from app.services.agent import (
+    AgentError,
+    generate_omniparser_plan,
+    generate_plan,
+    generate_som_plan,
+    generate_som_refine,
+)
 from app.services.mock import get_mock_plan
+from app.services.omniparser import (
+    OmniElement,
+    OmniParserResult,
+    format_elements_context,
+    parse_screenshot as omniparser_parse,
+)
 
 router = APIRouter()
 
@@ -318,6 +333,97 @@ def _crop_and_draw_sub_markers(
     return crop_rect, buf.getvalue(), sub_markers
 
 
+# ---------------------------------------------------------------------------
+# OmniParser pipeline: convert OmniPlanResponse → StepPlan using element bboxes
+# ---------------------------------------------------------------------------
+
+
+def _omni_plan_to_step_plan(
+    omni_plan: OmniPlanResponse,
+    elements: list[OmniElement],
+) -> StepPlan:
+    """
+    Convert an OmniParser plan (element IDs per step) to a standard StepPlan.
+    Each element_id maps to a bounding box from OmniParser's detection.
+    If a step references multiple elements, they are merged into a single bbox.
+    """
+    elem_map = {e.id: e for e in elements}
+    converted_steps: list[Step] = []
+
+    for omni_step in omni_plan.steps:
+        # Collect bboxes for all referenced elements
+        found_elements: list[OmniElement] = []
+        for eid in omni_step.element_ids:
+            elem = elem_map.get(eid)
+            if elem is None:
+                print(f"[omni] WARNING: element_id={eid} not found in OmniParser results, skipping")
+                continue
+            found_elements.append(elem)
+
+        if not found_elements:
+            # Fallback: center of screen
+            converted_steps.append(Step(
+                id=omni_step.id,
+                instruction=omni_step.instruction,
+                targets=[TargetRect(
+                    type=TargetType.bbox_norm,
+                    x=0.4, y=0.4, w=0.2, h=0.2,
+                    confidence=0.1,
+                    label="fallback — element not found",
+                )],
+                advance=omni_step.advance,
+                safety=omni_step.safety,
+            ))
+            continue
+
+        # Compute bounding box spanning all referenced elements
+        all_x1 = [e.bbox_xyxy[0] for e in found_elements]
+        all_y1 = [e.bbox_xyxy[1] for e in found_elements]
+        all_x2 = [e.bbox_xyxy[2] for e in found_elements]
+        all_y2 = [e.bbox_xyxy[3] for e in found_elements]
+
+        merged_x1 = max(0.0, min(all_x1))
+        merged_y1 = max(0.0, min(all_y1))
+        merged_x2 = min(1.0, max(all_x2))
+        merged_y2 = min(1.0, max(all_y2))
+
+        w = max(merged_x2 - merged_x1, 0.02)
+        h = max(merged_y2 - merged_y1, 0.02)
+
+        # Clamp to ensure x+w <= 1 and y+h <= 1
+        x = min(merged_x1, 1.0 - w)
+        y = min(merged_y1, 1.0 - h)
+
+        # Use the first element's content as label
+        label = found_elements[0].content if found_elements else None
+
+        targets = [TargetRect(
+            type=TargetType.bbox_norm,
+            x=x, y=y, w=w, h=h,
+            confidence=omni_step.confidence,
+            label=label,
+        )]
+
+        converted_steps.append(Step(
+            id=omni_step.id,
+            instruction=omni_step.instruction,
+            targets=targets,
+            advance=omni_step.advance,
+            safety=omni_step.safety,
+        ))
+
+    return StepPlan(
+        version=omni_plan.version,
+        goal=omni_plan.goal,
+        image_size=omni_plan.image_size,
+        steps=converted_steps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Two-pass SoM refinement (legacy): dense sub-grid on a zoomed crop
+# ---------------------------------------------------------------------------
+
 async def _refine_plan_two_pass(
     plan: StepPlan,
     original_screenshot_bytes: bytes,
@@ -428,18 +534,21 @@ async def create_plan(
     """
     Generate a step-by-step guidance plan from a goal and screenshot.
 
-    SoM pipeline (default when no markers_json):
-      Server generates markers and draws them on the screenshot at actual
-      pixel resolution, then asks the model to pick marker IDs.
+    OmniParser pipeline (default):
+      Screenshot → OmniParser (UI element detection) → LLM (step planning) → StepPlan
+      Controlled by USE_OMNIPARSER env var (default: "true").
 
-    Legacy pipeline (when markers_json is explicitly set to "none"):
-      Model outputs raw coordinates directly.
+    SoM pipeline (legacy, USE_OMNIPARSER=false):
+      Screenshot → grid markers → LLM → two-pass refinement → StepPlan
     """
     request_id = getattr(request.state, "request_id", "unknown")
 
-    # Use SoM by default; only skip if markers_json is explicitly "none"
-    use_som = markers_json != "none"
-    print(f"[plan] rid={request_id} goal={goal!r} som={use_som}")
+    use_omniparser = os.getenv("USE_OMNIPARSER", "true").lower() == "true"
+    # Legacy SoM fallback: only when OmniParser is disabled and markers_json != "none"
+    use_som = not use_omniparser and markers_json != "none"
+
+    pipeline = "omniparser" if use_omniparser else ("som" if use_som else "legacy")
+    print(f"[plan] rid={request_id} goal={goal!r} pipeline={pipeline}")
 
     # --- Parse and validate image_size ---
     try:
@@ -465,8 +574,55 @@ async def create_plan(
 
     # --- Generate plan via AI ---
     try:
-        if use_som:
-            # Server-side SoM: generate markers and draw them at actual pixel resolution
+        if use_omniparser:
+            # ----- OmniParser pipeline -----
+            # Step 1: Run OmniParser to detect UI elements
+            print(f"[plan] rid={request_id} running OmniParser element detection...")
+            omni_result = await omniparser_parse(
+                screenshot_bytes=screenshot_bytes,
+                request_id=request_id,
+            )
+
+            print(f"[plan] rid={request_id} OmniParser detected {len(omni_result.elements)} elements")
+            for elem in omni_result.elements:
+                x, y, w, h = elem.bbox_xywh
+                print(f"[plan] rid={request_id} ELEMENT [{elem.id}] {elem.type}: \"{elem.content}\" bbox=({x:.3f},{y:.3f},{w:.3f},{h:.3f})")
+
+            # Save annotated screenshot for debugging
+            try:
+                with open("/tmp/overlayguide_omniparser_annotated.png", "wb") as f:
+                    f.write(omni_result.annotated_image_bytes)
+            except Exception:
+                pass
+
+            # Step 2: Format element list as context for LLM
+            elements_context = format_elements_context(omni_result.elements)
+
+            # Step 3: Ask LLM to select elements and generate plan
+            omni_plan = await generate_omniparser_plan(
+                goal=goal,
+                image_size=parsed_size,
+                annotated_screenshot_bytes=omni_result.annotated_image_bytes,
+                elements_context=elements_context,
+                learning_profile=learning_profile,
+                app_context=app_context,
+                session_summary=session_summary,
+                request_id=request_id,
+            )
+
+            # Log what the LLM picked
+            for step in omni_plan.steps:
+                print(f"[plan] rid={request_id} OMNI PICK: step={step.id} element_ids={step.element_ids} conf={step.confidence}")
+
+            # Step 4: Convert element IDs → bounding box targets
+            plan = _omni_plan_to_step_plan(omni_plan, omni_result.elements)
+
+            for step in plan.steps:
+                for t in step.targets:
+                    print(f"[plan] rid={request_id} OMNI TARGET: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
+
+        elif use_som:
+            # ----- SoM pipeline (legacy) -----
             markers, marked_screenshot = _generate_markers_and_image(screenshot_bytes)
 
             # Save marked screenshot for debugging
@@ -502,14 +658,14 @@ async def create_plan(
                 for t in step.targets:
                     print(f"[plan] rid={request_id} MARKER TARGET: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
 
-            # Two-pass SoM: dense sub-grid on zoomed crop, model picks sub-marker
+            # Two-pass SoM: dense sub-grid on zoomed crop
             plan = await _refine_plan_two_pass(plan, screenshot_bytes, request_id)
 
             for step in plan.steps:
                 for t in step.targets:
                     print(f"[plan] rid={request_id} REFINED TARGET: step={step.id} ({t.x:.3f},{t.y:.3f},{t.w:.3f},{t.h:.3f}) label={t.label!r}")
         else:
-            # Legacy pipeline: model outputs raw coordinates
+            # ----- Legacy pipeline: model outputs raw coordinates -----
             plan = await generate_plan(
                 goal=goal,
                 image_size=parsed_size,
@@ -526,5 +682,5 @@ async def create_plan(
         print(f"[plan] rid={request_id} unexpected error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
-    print(f"[plan] rid={request_id} success, {len(plan.steps)} steps (som={use_som})")
+    print(f"[plan] rid={request_id} success, {len(plan.steps)} steps (pipeline={pipeline})")
     return plan

@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 from app.schemas.step_plan import (
     BBoxNorm,
     ImageSize,
+    OmniPlanResponse,
     RefineResponse,
     SoMStepPlan,
     StepPlan,
@@ -37,6 +38,9 @@ _REFINE_PROMPT_TEMPLATE = _REFINE_PROMPT_PATH.read_text()
 
 _SOM_REFINE_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "som_refine_prompt.txt"
 _SOM_REFINE_PROMPT_TEMPLATE = _SOM_REFINE_PROMPT_PATH.read_text()
+
+_OMNI_PLAN_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "omniparser_plan_prompt.txt"
+_OMNI_PLAN_PROMPT_TEMPLATE = _OMNI_PLAN_PROMPT_PATH.read_text()
 
 # ---------------------------------------------------------------------------
 # OpenAI client (lazy singleton)
@@ -675,3 +679,87 @@ async def generate_som_refine(
             print(f"[agent] rid={request_id} som-refine attempt={attempt + 1} error: {type(e).__name__}: {e}")
 
     raise last_error or AgentError("Unknown som-refine failure")
+
+
+# ---------------------------------------------------------------------------
+# OmniParser-based plan generation (element ID selection)
+# ---------------------------------------------------------------------------
+
+
+async def generate_omniparser_plan(
+    goal: str,
+    image_size: ImageSize,
+    annotated_screenshot_bytes: bytes,
+    elements_context: str,
+    learning_profile: str | None = None,
+    app_context: str | None = None,
+    session_summary: str | None = None,
+    request_id: str = "",
+) -> OmniPlanResponse:
+    """
+    Given an OmniParser-annotated screenshot and a structured element list,
+    ask the LLM to select which element IDs correspond to each step.
+    Returns an OmniPlanResponse with element_ids per step.
+    """
+    client = _get_client()
+
+    image_size_json = json.dumps({"w": image_size.w, "h": image_size.h})
+    prompt = _OMNI_PLAN_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{GOAL}}", goal)
+    prompt = prompt.replace("{{IMAGE_SIZE_JSON}}", image_size_json)
+    prompt = prompt.replace("{{ELEMENTS_CONTEXT}}", elements_context)
+    prompt = prompt.replace("{{LEARNING_PROFILE_TEXT}}", learning_profile or "default")
+    prompt = prompt.replace("{{APP_CONTEXT_JSON}}", app_context or "{}")
+    prompt = prompt.replace("{{SESSION_SUMMARY}}", session_summary or "none")
+
+    screenshot_b64 = base64.b64encode(annotated_screenshot_bytes).decode("utf-8")
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_b64}",
+                        "detail": "high",
+                    },
+                },
+            ],
+        }
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            print(f"[agent] rid={request_id} omni-plan attempt={attempt + 1} model={model} goal={goal!r}")
+
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **_model_params(model, 2000),
+                response_format={"type": "json_object"},
+            )
+
+            raw_text = response.choices[0].message.content or ""
+            print(f"[agent] rid={request_id} omni-plan raw response length={len(raw_text)}")
+
+            plan_dict = _extract_json(raw_text)
+            plan = OmniPlanResponse.model_validate(plan_dict)
+
+            print(f"[agent] rid={request_id} omni-plan validated: {len(plan.steps)} steps")
+            return plan
+
+        except AgentError:
+            raise
+        except json.JSONDecodeError as e:
+            last_error = AgentError(f"Invalid JSON from OmniParser model: {e}")
+            print(f"[agent] rid={request_id} omni-plan attempt={attempt + 1} JSON parse error: {e}")
+        except Exception as e:
+            last_error = AgentError(f"OmniParser model call failed: {type(e).__name__}: {e}")
+            print(f"[agent] rid={request_id} omni-plan attempt={attempt + 1} error: {type(e).__name__}: {e}")
+
+    raise last_error or AgentError("Unknown OmniParser plan failure")

@@ -5,3 +5,6 @@ openai
 python-multipart
 pillow
 python-dotenv
+gradio_client
+ultralytics
+huggingface_hub
