@@ -8,9 +8,15 @@ let package = Package(
     platforms: [
         .macOS(.v13)
     ],
+    dependencies: [
+        .package(url: "https://github.com/stasel/WebRTC.git", .upToNextMajor(from: "125.0.0")),
+    ],
     targets: [
         .executableTarget(
             name: "OverlayGuide",
+            dependencies: [
+                .product(name: "WebRTC", package: "WebRTC"),
+            ],
             path: "OverlayGuide"
         ),
     ]

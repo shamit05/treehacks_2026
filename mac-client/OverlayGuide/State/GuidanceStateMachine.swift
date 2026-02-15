@@ -5,8 +5,7 @@
 // Owns the session state, controls step progression, and
 // coordinates between capture, networking, and overlay.
 //
-// All SoM marker generation and refinement happens server-side.
-// The client just sends raw screenshots and receives refined TargetRects.
+// This is an ObservableObject so SwiftUI views can react to changes.
 
 import AppKit
 import Combine
@@ -31,8 +30,30 @@ class GuidanceStateMachine: ObservableObject {
     @Published var hintMessage: String?
     @Published private(set) var completedSteps: [Step] = []
     @Published private(set) var capturedScreenBounds: CGRect?
-    @Published var completionMessage: String?
-    @Published var loadingStatus: String = "Processing screen..."
+
+    // MARK: - Voice Mode State
+
+    @Published var voiceMode: VoiceMode = .disabled
+    @Published var isVoiceListening: Bool = false
+    @Published var voiceStatusMessage: String?
+
+    enum VoiceMode: Equatable {
+        case disabled
+        case voiceInputOnly
+        case voiceOutputOnly
+        case voiceInputAndOutput
+    }
+
+    // Voice pipeline clients (injected via initializeVoice)
+    private var webrtcClient: WebRTCClient?
+    private var overlaySyncClient: OverlaySyncClient?
+    private var voiceCancellables = Set<AnyCancellable>()
+    private var voicePipelineActive = false
+
+    // Screenshot cache: avoids redundant captures when user speaks rapidly (2s TTL)
+    private var cachedScreenshot: Data?
+    private var cachedScreenshotTimestamp: Date?
+    private let screenshotCacheTTL: TimeInterval = 2.0
 
     // MARK: - Session
 
@@ -45,6 +66,11 @@ class GuidanceStateMachine: ObservableObject {
     private let lastGoalPath = "/tmp/overlayguide_last_goal.txt"
     private let lastScreenshotPath = "/tmp/overlayguide_last_screenshot.png"
     private let coordinateDebugEnabled = true
+    private var currentMarkersByID: [Int: SOMMarker] = [:]
+    private var stepMarkerByStepID: [String: SOMMarker] = [:]
+    private var stepMissCounts: [String: Int] = [:]
+    private var refinedStepIDs: Set<String> = []
+    private var refineInFlight = false
 
     init(networkClient: AgentNetworkClient, captureService: ScreenCaptureService) {
         self.networkClient = networkClient
@@ -92,37 +118,27 @@ class GuidanceStateMachine: ObservableObject {
             do {
                 // Give the window system a brief moment to remove overlay windows.
                 try? await Task.sleep(nanoseconds: 150_000_000)
-
-                loadingStatus = "Capturing screen..."
-                self.phase = .loading
-
                 let screenshot = try await captureService.captureMainDisplay()
                 self.capturedScreenBounds = screenshot.screenBounds
-                let imgSize = ImageSize(
-                    w: Int(screenshot.screenBounds.width),
-                    h: Int(screenshot.screenBounds.height)
-                )
-
+                self.currentMarkersByID = [:]
+                self.stepMarkerByStepID = [:]
+                self.stepMissCounts = [:]
+                self.refinedStepIDs = []
                 saveDebugArtifacts(goal: goal, screenshotData: screenshot.imageData)
 
-                loadingStatus = "Analyzing UI elements..."
-
-                // Progressive status updates while waiting
-                Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 2_500_000_000)
-                    if self.phase == .loading { self.loadingStatus = "Creating plan..." }
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    if self.phase == .loading { self.loadingStatus = "Generating overlays..." }
-                }
-
+                let markers = MarkerGenerator.generateGridMarkers()
+                let markedScreenshot = try MarkerGenerator.renderMarkers(on: screenshot.imageData, markers: markers)
+                let markersByID = Dictionary(uniqueKeysWithValues: markers.map { ($0.id, $0) })
+                // Show loading only after the screenshot is already captured.
+                self.phase = .loading
                 let plan = try await networkClient.requestPlan(
                     goal: goal,
-                    screenshotData: screenshot.imageData,
-                    imageSize: imgSize,
+                    screenshotWithMarkersData: markedScreenshot,
+                    markers: markers,
+                    imageSize: ImageSize(w: screenshot.pixelWidth, h: screenshot.pixelHeight),
                     learningProfile: session.learningProfile
                 )
-
-                self.applyInitialPlan(plan)
+                self.applyInitialPlan(plan, markersByID: markersByID)
             } catch {
                 self.phase = .error(error.localizedDescription)
             }
@@ -130,75 +146,34 @@ class GuidanceStateMachine: ObservableObject {
     }
 
     /// External integration entry point for the first `/plan` response.
-    func applyInitialPlan(_ plan: StepPlan) {
-        currentPlan = plan
+    func applyInitialPlan(_ plan: StepPlan, markersByID: [Int: SOMMarker] = [:]) {
+        let renderedPlan = materializePlanTargets(plan, markersByID: markersByID)
+        currentPlan = renderedPlan
         currentStepIndex = 0
         completedSteps = []
-        session.stepPlan = plan
+        session.stepPlan = renderedPlan
         session.currentStepIndex = 0
+        currentMarkersByID = markersByID
+        stepMissCounts = [:]
+        refinedStepIDs = []
         addEvent(.planReceived)
         logStepTargets(context: "initial-plan")
         phase = .guiding
+        triggerRefineIfNeededForCurrentStep()
     }
 
     /// External integration entry point for `/next` responses.
-    /// Handles status: "continue" (more steps), "done" (task complete), "retry" (try again).
-    func applyNextResponse(_ response: NextStepResponse) {
-        switch response.status {
-        case "done":
-            // Task is complete!
-            addEvent(.planReceived, detail: "done")
-            print("[State] Task complete: \(response.message ?? "done")")
-            completionMessage = response.message ?? "All done!"
-            phase = .completed
-
-        case "retry":
-            // Action didn't take effect — stay on current step
-            addEvent(.planReceived, detail: "retry")
-            print("[State] Retry: \(response.message ?? "try again")")
-            hintMessage = response.message ?? "That didn't seem to work. Try clicking the highlighted area again."
-            phase = .guiding
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                self.hintMessage = nil
-            }
-
-        default:
-            // "continue" — more steps to follow
-            guard !response.steps.isEmpty else {
-                // No steps but status is continue — treat as done
-                completionMessage = response.message ?? "All done!"
-                phase = .completed
-                return
-            }
-            let plan = StepPlan(
-                version: response.version,
-                goal: response.goal,
-                appContext: nil,
-                imageSize: response.imageSize,
-                steps: response.steps
-            )
-            currentPlan = plan
-            currentStepIndex = 0
-            session.stepPlan = plan
-            session.currentStepIndex = 0
-            addEvent(.planReceived, detail: "next")
-            logStepTargets(context: "next-plan")
-            phase = .guiding
-        }
-    }
-
-    /// Convenience: apply a StepPlan as a "continue" next response.
     func applyNextPlan(_ plan: StepPlan) {
-        let response = NextStepResponse(
-            version: plan.version,
-            goal: plan.goal,
-            status: "continue",
-            message: nil,
-            imageSize: plan.imageSize,
-            steps: plan.steps
-        )
-        applyNextResponse(response)
+        currentPlan = plan
+        currentStepIndex = 0
+        session.stepPlan = plan
+        session.currentStepIndex = 0
+        stepMarkerByStepID = [:]
+        stepMissCounts = [:]
+        refinedStepIDs = []
+        addEvent(.planReceived, detail: "next")
+        logStepTargets(context: "next-plan")
+        phase = .guiding
     }
 
     /// Debug integration helper: apply a raw JSON StepPlan payload from `/plan` or `/next`.
@@ -212,11 +187,7 @@ class GuidanceStateMachine: ObservableObject {
         }
     }
 
-    /// Handle a mouse click at screen coordinates.
-    /// NOTE: `point` comes from CGEvent.location which uses Quartz coordinates
-    /// (top-left origin, Y increases downward) — same convention as our
-    /// normalized [0,1] coordinates. capturedScreenBounds is from CGDisplayBounds
-    /// which is also Quartz. So we normalize directly WITHOUT flipping Y.
+    /// Handle a mouse click at screen coordinates
     func handleClick(at point: CGPoint) {
         guard phase == .guiding,
               let plan = currentPlan,
@@ -225,15 +196,7 @@ class GuidanceStateMachine: ObservableObject {
         let step = plan.steps[currentStepIndex]
         let screenBounds = capturedScreenBounds ?? NSScreen.main?.frame
         guard let screenBounds else { return }
-
-        // Normalize CGEvent point (Quartz top-left origin) to [0,1] (also top-left origin).
-        // Both coordinate systems use top-left origin, so NO Y-flip needed.
-        let normX = (point.x - screenBounds.origin.x) / screenBounds.width
-        let normY = (point.y - screenBounds.origin.y) / screenBounds.height
-        let normalizedClick = CGPoint(x: normX, y: normY)
-
-        // Check bounds (allow small margin outside [0,1] for edge clicks)
-        guard normX >= -0.02 && normX <= 1.02 && normY >= -0.02 && normY <= 1.02 else {
+        guard screenBounds.contains(point) else {
             addEvent(.clickMiss)
             hintMessage = "Try clicking the highlighted area"
             Task { @MainActor in
@@ -243,8 +206,26 @@ class GuidanceStateMachine: ObservableObject {
             return
         }
 
+        let mapper = CoordinateMapper(
+            screenBounds: screenBounds,
+            scaleFactor: NSScreen.main?.backingScaleFactor ?? 1.0
+        )
+        let normalizedClick = mapper.screenToNormalized(point)
         if coordinateDebugEnabled {
             print("[CoordsDebug] click screen=(\(format(point.x)), \(format(point.y))) normalized=(\(format(normalizedClick.x)), \(format(normalizedClick.y))) bounds=\(rectString(screenBounds))")
+        }
+
+        if coordinateDebugEnabled {
+            for (idx, target) in step.targets.enumerated() {
+                guard let targetRect = mapper.normalizedToScreen(target) else {
+                    print("[CoordsDebug] target[\(idx)] non-bbox type=\(target.type.rawValue) hit=false")
+                    continue
+                }
+                let inside = normalizedPoint(normalizedClick, isInside: target)
+                print(
+                    "[CoordsDebug] target[\(idx)] norm=(x:\(format(target.x ?? -1)), y:\(format(target.y ?? -1)), w:\(format(target.w ?? -1)), h:\(format(target.h ?? -1))) screen=\(rectString(targetRect)) hit=\(inside)"
+                )
+            }
         }
 
         let hitTarget = step.targets.first { target in
@@ -252,10 +233,14 @@ class GuidanceStateMachine: ObservableObject {
         }
 
         if hitTarget != nil {
+            stepMissCounts[step.id] = 0
             handleStepCompletionFromClick()
         } else {
             addEvent(.clickMiss)
+            stepMissCounts[step.id, default: 0] += 1
             hintMessage = "Try clicking the highlighted area"
+            triggerRefineIfNeeded(for: step)
+            // Clear hint after 2 seconds
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 self.hintMessage = nil
@@ -264,6 +249,7 @@ class GuidanceStateMachine: ObservableObject {
     }
 
     /// Called when a click successfully hits the current step target.
+    /// Captures a fresh screenshot and asks `/next` for updated guidance.
     func handleStepCompletionFromClick() {
         guard phase == .guiding,
               let plan = currentPlan,
@@ -274,30 +260,29 @@ class GuidanceStateMachine: ObservableObject {
         addEvent(.clickHit)
         addEvent(.stepAdvanced)
 
-        loadingStatus = "Processing next step..."
         phase = .loading
 
         Task { @MainActor in
             do {
+                // NOTE: we intentionally only trigger next-step refresh after a click completion,
+                // not hover or tooltip changes, to avoid false state-change detections.
                 let screenshot = try await captureService.captureMainDisplay()
                 self.capturedScreenBounds = screenshot.screenBounds
-                let imgSize = ImageSize(
-                    w: Int(screenshot.screenBounds.width),
-                    h: Int(screenshot.screenBounds.height)
-                )
-
-                let nextResponse = try await networkClient.requestNext(
+                let nextPlan = try await networkClient.requestNext(
                     goal: session.goal,
                     screenshotData: screenshot.imageData,
-                    imageSize: imgSize,
+                    imageSize: ImageSize(
+                        w: screenshot.pixelWidth,
+                        h: screenshot.pixelHeight
+                    ),
                     completedSteps: completedSteps,
                     totalSteps: max(completedSteps.count, session.stepPlan?.steps.count ?? plan.steps.count),
                     learningProfile: session.learningProfile,
                     appContext: session.appContext
                 )
-                applyNextResponse(nextResponse)
+                applyNextPlan(nextPlan)
             } catch {
-                // Fallback to local step progression
+                // Fallback to local step progression if `/next` is unavailable.
                 phase = .guiding
                 advanceStep()
                 hintMessage = "Live refresh unavailable. Continuing with existing steps."
@@ -328,15 +313,168 @@ class GuidanceStateMachine: ObservableObject {
         currentPlan = nil
         currentStepIndex = 0
         hintMessage = nil
-        completionMessage = nil
         capturedScreenBounds = nil
         completedSteps = []
+        currentMarkersByID = [:]
+        stepMarkerByStepID = [:]
+        stepMissCounts = [:]
+        refinedStepIDs = []
+        refineInFlight = false
+
+        // Voice state cleanup
+        isVoiceListening = false
+        voiceStatusMessage = nil
+        voicePipelineActive = false
+        cachedScreenshot = nil
+        cachedScreenshotTimestamp = nil
+        webrtcClient?.stopListening()
+        overlaySyncClient?.reset()
+
         session = SessionSnapshot(
             sessionId: UUID(),
             goal: "",
             currentStepIndex: 0,
             events: []
         )
+    }
+
+    // MARK: - Voice Integration
+
+    /// Initialize the voice pipeline clients.
+    /// Call once from AppDelegate after services are configured.
+    ///
+    /// Flow:
+    ///   1. Create WebRTCClient and connect (POST /offer → get SDP answer + session_id)
+    ///   2. Connect OverlaySyncClient to /ws/{session_id} for control channel
+    ///   3. Subscribe to plan updates and screenshot requests
+    func initializeVoice(botURL: URL) async throws {
+        guard voiceMode == .disabled else {
+            print("[Voice] Already initialized")
+            return
+        }
+
+        let rtcClient = WebRTCClient(botURL: botURL)
+        webrtcClient = rtcClient
+        overlaySyncClient = OverlaySyncClient()
+
+        // 1. Connect WebRTC for audio → gets session_id from /offer response
+        try await rtcClient.connect()
+
+        guard let sessionId = rtcClient.sessionId else {
+            throw VoiceError.noSessionId
+        }
+
+        // 2. Connect overlay sync WebSocket to /ws/{session_id}
+        try await overlaySyncClient?.connect(baseURL: botURL, sessionId: sessionId)
+
+        // 3a. Subscribe to plan updates from overlay sync
+        overlaySyncClient?.planReceivedSubject
+            .receive(on: RunLoop.main)
+            .sink { [weak self] plan in
+                guard let self else { return }
+                self.currentPlan = plan
+                self.currentStepIndex = 0
+                self.completedSteps = []
+                self.session.stepPlan = plan
+                self.session.currentStepIndex = 0
+                self.addEvent(.planReceived, detail: "voice")
+                self.phase = .guiding
+                self.voiceStatusMessage = nil
+                self.voicePipelineActive = false
+            }
+            .store(in: &voiceCancellables)
+
+        // 3b. Subscribe to screenshot requests from the bot
+        overlaySyncClient?.screenshotRequestedSubject
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in
+                guard let self else { return }
+                Task { @MainActor in
+                    await self.sendScreenshotToBot()
+                }
+            }
+            .store(in: &voiceCancellables)
+
+        // 3c. Watch for WebRTC connection failures → graceful degradation
+        rtcClient.$connectionState
+            .receive(on: RunLoop.main)
+            .sink { [weak self] state in
+                guard let self else { return }
+                if case .failed(let msg) = state {
+                    self.voiceMode = .disabled
+                    self.isVoiceListening = false
+                    self.hintMessage = msg
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        self.hintMessage = nil
+                    }
+                }
+            }
+            .store(in: &voiceCancellables)
+
+        voiceMode = .voiceInputAndOutput
+        print("[Voice] Voice pipeline initialized (session=\(sessionId))")
+    }
+
+    /// Submit a goal via voice. Captures a screenshot and starts listening.
+    /// The Pipecat pipeline handles STT → planning → TTS.
+    func submitVoiceGoal() async {
+        guard voiceMode != .disabled else {
+            print("[Voice] Voice mode is disabled")
+            return
+        }
+        // Guard against overlapping pipelines
+        guard !voicePipelineActive else {
+            print("[Voice] Pipeline already active, ignoring")
+            return
+        }
+        voicePipelineActive = true
+
+        voiceStatusMessage = "Listening..."
+        isVoiceListening = true
+        webrtcClient?.startListening()
+
+        // Pre-capture a screenshot so it's ready when the bot asks for it
+        await sendScreenshotToBot()
+    }
+
+    /// Capture the screen and send it to the bot via the control WebSocket.
+    private func sendScreenshotToBot() async {
+        do {
+            let screenshot = try await captureService.captureMainDisplay()
+            cachedScreenshot = screenshot.imageData
+            cachedScreenshotTimestamp = Date()
+            capturedScreenBounds = screenshot.screenBounds
+            await overlaySyncClient?.sendScreenshot(
+                screenshot.imageData,
+                imageSize: (w: screenshot.pixelWidth, h: screenshot.pixelHeight)
+            )
+        } catch {
+            print("[Voice] Failed to capture/send screenshot: \(error)")
+        }
+    }
+
+    /// Stop voice listening (user cancelled or finished speaking)
+    func stopVoiceListening() {
+        webrtcClient?.stopListening()
+        isVoiceListening = false
+        if voicePipelineActive {
+            voiceStatusMessage = "Processing..."
+        }
+    }
+
+    /// Tear down voice connections completely
+    func teardownVoice() {
+        voiceCancellables.removeAll()
+        webrtcClient?.disconnect()
+        overlaySyncClient?.disconnect()
+        webrtcClient = nil
+        overlaySyncClient = nil
+        voiceMode = .disabled
+        isVoiceListening = false
+        voiceStatusMessage = nil
+        voicePipelineActive = false
+        print("[Voice] Voice pipeline torn down")
     }
 
     // MARK: - Private
@@ -350,14 +488,18 @@ class GuidanceStateMachine: ObservableObject {
     }
 
     private func normalizedPoint(_ point: CGPoint, isInside target: TargetRect) -> Bool {
-        guard target.hasBBox, let tx = target.x, let ty = target.y, let tw = target.w, let th = target.h else {
+        guard target.type == .bboxNorm,
+              let x = target.x,
+              let y = target.y,
+              let w = target.w,
+              let h = target.h else {
             return false
         }
         let epsilon: CGFloat = 0.001
-        let minX = CGFloat(tx) - epsilon
-        let minY = CGFloat(ty) - epsilon
-        let maxX = CGFloat(tx + tw) + epsilon
-        let maxY = CGFloat(ty + th) + epsilon
+        let minX = CGFloat(x) - epsilon
+        let minY = CGFloat(y) - epsilon
+        let maxX = CGFloat(x + w) + epsilon
+        let maxY = CGFloat(y + h) + epsilon
         return point.x >= minX && point.x <= maxX && point.y >= minY && point.y <= maxY
     }
 
@@ -371,9 +513,172 @@ class GuidanceStateMachine: ObservableObject {
         print("[CoordsDebug] \(context) step=\(currentStepIndex + 1)/\(plan.steps.count) bounds=\(rectString(screenBounds))")
         for (idx, target) in step.targets.enumerated() {
             if let rect = mapper.normalizedToScreen(target) {
-                print("[CoordsDebug] target[\(idx)] norm=(x:\(format(target.x ?? -1)), y:\(format(target.y ?? -1)), w:\(format(target.w ?? -1)), h:\(format(target.h ?? -1))) screen=\(rectString(rect))")
+                print(
+                    "[CoordsDebug] target[\(idx)] norm=(x:\(format(target.x ?? -1)), y:\(format(target.y ?? -1)), w:\(format(target.w ?? -1)), h:\(format(target.h ?? -1))) screen=\(rectString(rect))"
+                )
+            } else {
+                print("[CoordsDebug] target[\(idx)] non-bbox type=\(target.type.rawValue)")
             }
         }
+    }
+
+    private func materializePlanTargets(_ plan: StepPlan, markersByID: [Int: SOMMarker]) -> StepPlan {
+        var updatedSteps: [Step] = []
+        stepMarkerByStepID = [:]
+
+        for step in plan.steps {
+            var updatedTargets: [TargetRect] = []
+            for target in step.targets {
+                switch target.type {
+                case .bboxNorm:
+                    updatedTargets.append(target)
+                case .somMarker:
+                    guard let markerID = target.markerId,
+                          let marker = markersByID[markerID] else {
+                        continue
+                    }
+                    if stepMarkerByStepID[step.id] == nil {
+                        stepMarkerByStepID[step.id] = marker
+                    }
+                    updatedTargets.append(
+                        CropRefiner.defaultBBox(
+                            around: marker,
+                            confidence: target.confidence,
+                            label: target.label
+                        )
+                    )
+                }
+            }
+
+            if updatedTargets.isEmpty {
+                updatedTargets = [
+                    TargetRect(
+                        type: .bboxNorm,
+                        markerId: nil,
+                        x: 0.45,
+                        y: 0.45,
+                        w: 0.1,
+                        h: 0.1,
+                        confidence: 0.2,
+                        label: "fallback target"
+                    )
+                ]
+            }
+
+            updatedSteps.append(
+                Step(
+                    id: step.id,
+                    instruction: step.instruction,
+                    targets: updatedTargets,
+                    advance: step.advance,
+                    safety: step.safety
+                )
+            )
+        }
+
+        return StepPlan(
+            version: plan.version,
+            goal: plan.goal,
+            appContext: plan.appContext,
+            imageSize: plan.imageSize,
+            steps: updatedSteps
+        )
+    }
+
+    private func triggerRefineIfNeededForCurrentStep() {
+        guard let plan = currentPlan,
+              currentStepIndex < plan.steps.count else { return }
+        triggerRefineIfNeeded(for: plan.steps[currentStepIndex])
+    }
+
+    private func triggerRefineIfNeeded(for step: Step) {
+        guard shouldTriggerRefine(for: step) else { return }
+        Task { @MainActor in
+            await refineCurrentStep(step)
+        }
+    }
+
+    private func shouldTriggerRefine(for step: Step) -> Bool {
+        if refineInFlight || refinedStepIDs.contains(step.id) {
+            return false
+        }
+        guard stepMarkerByStepID[step.id] != nil else {
+            return false
+        }
+
+        let misses = stepMissCounts[step.id, default: 0]
+        let confidence = step.targets.first?.confidence ?? 1.0
+        if confidence < 0.7 {
+            return misses >= 1
+        }
+        return misses >= 2
+    }
+
+    @MainActor
+    private func refineCurrentStep(_ step: Step) async {
+        guard let marker = stepMarkerByStepID[step.id], !refineInFlight else { return }
+        refineInFlight = true
+        defer { refineInFlight = false }
+
+        do {
+            let screenshot = try await captureService.captureMainDisplay()
+            capturedScreenBounds = screenshot.screenBounds
+            let cropRect = CropRefiner.makeCropRect(around: marker)
+            let cropData = try CropRefiner.cropImage(pngData: screenshot.imageData, cropRect: cropRect)
+            let refinedCropBBox = try await networkClient.requestRefine(
+                goal: session.goal,
+                stepId: step.id,
+                instruction: step.instruction,
+                cropImageData: cropData,
+                cropRectFullNorm: cropRect,
+                sessionSummary: recentSessionSummary()
+            )
+
+            guard let stitched = BBoxStitcher.stitch(cropRect: cropRect, cropBBox: refinedCropBBox) else {
+                return
+            }
+
+            updateStepTarget(stepID: step.id, target: stitched)
+            refinedStepIDs.insert(step.id)
+            hintMessage = "Target refined for better accuracy."
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                self.hintMessage = nil
+            }
+            logStepTargets(context: "refined")
+        } catch {
+            print("[Refine] failed for step \(step.id): \(error.localizedDescription)")
+        }
+    }
+
+    private func updateStepTarget(stepID: String, target: TargetRect) {
+        guard let plan = currentPlan else { return }
+        let updatedSteps = plan.steps.map { step -> Step in
+            guard step.id == stepID else { return step }
+            return Step(
+                id: step.id,
+                instruction: step.instruction,
+                targets: [target],
+                advance: step.advance,
+                safety: step.safety
+            )
+        }
+        currentPlan = StepPlan(
+            version: plan.version,
+            goal: plan.goal,
+            appContext: plan.appContext,
+            imageSize: plan.imageSize,
+            steps: updatedSteps
+        )
+        session.stepPlan = currentPlan
+    }
+
+    private func recentSessionSummary() -> String {
+        let recent = session.events.suffix(5)
+        if recent.isEmpty {
+            return "none"
+        }
+        return recent.map { "\($0.type.rawValue):\($0.detail ?? "-")" }.joined(separator: "; ")
     }
 
     private func rectString(_ rect: CGRect) -> String {
@@ -400,6 +705,19 @@ class GuidanceStateMachine: ObservableObject {
             print("[Debug] Saved screenshot to \(lastScreenshotPath)")
         } catch {
             print("[Debug] Failed to save artifacts: \(error.localizedDescription)")
+        }
+    }
+}
+
+// MARK: - Voice Errors
+
+enum VoiceError: Error, LocalizedError {
+    case noSessionId
+
+    var errorDescription: String? {
+        switch self {
+        case .noSessionId:
+            return "WebRTC connection succeeded but no session_id was returned"
         }
     }
 }

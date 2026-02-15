@@ -2,7 +2,8 @@
 // Owner: Shared (App entry point)
 //
 // AppDelegate bootstraps the app: creates the state machine,
-// starts the input monitor, and prepares overlay windows.
+// starts the input monitor, prepares overlay windows, and
+// optionally initialises the voice pipeline.
 
 import AppKit
 import Combine
@@ -18,8 +19,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var networkClient: AgentNetworkClient!
     private var phaseCancellable: AnyCancellable?
 
+    // Voice pipeline configuration (set via environment or defaults)
+    // This is the base URL of the Modal ASGI app (handles /offer + /ws/{session_id})
+    private let voiceBotURLString = ProcessInfo.processInfo.environment["VOICE_BOT_URL"]
+        ?? "https://overlay-voice-assistant--serve-frontend.modal.run"
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // TODO: Check permissions (Screen Recording) and prompt if missing
+        // TODO: Check permissions (Screen Recording, Microphone) and prompt if missing
 
         if CommandLine.arguments.contains("--ui-test-help") {
             OverlayUITester.printUsage()
@@ -48,6 +54,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             inputMonitor.start()
         }
 
+        // Initialize voice pipeline if --enable-voice flag is set
+        if CommandLine.arguments.contains("--enable-voice") {
+            initializeVoicePipeline()
+        }
+
         // Fallback: force-show the popup once at launch so window rendering
         // works even if global hotkeys are flaky in this environment.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
@@ -64,5 +75,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         inputMonitor.stop()
         phaseCancellable?.cancel()
         overlayController.hideAll()
+
+        // Clean up voice resources
+        stateMachine.teardownVoice()
+    }
+
+    // MARK: - Voice Pipeline Initialization
+
+    private func initializeVoicePipeline() {
+        guard let botURL = URL(string: voiceBotURLString) else {
+            print("[AppDelegate] Invalid VOICE_BOT_URL: \(voiceBotURLString)")
+            return
+        }
+
+        print("[AppDelegate] Initializing voice pipeline...")
+        print("[AppDelegate]   Bot URL: \(voiceBotURLString)")
+
+        Task {
+            do {
+                try await stateMachine.initializeVoice(botURL: botURL)
+                print("[AppDelegate] Voice pipeline ready.")
+            } catch {
+                print("[AppDelegate] Voice initialization failed: \(error.localizedDescription)")
+                print("[AppDelegate] Continuing in text-only mode.")
+            }
+        }
     }
 }
