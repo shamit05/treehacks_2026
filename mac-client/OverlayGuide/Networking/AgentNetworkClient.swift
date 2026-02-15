@@ -11,12 +11,14 @@ class AgentNetworkClient {
 
     private let baseURL: URL
     private let session: URLSession
-    private let timeout: TimeInterval = 10.0  // 10s for agent requests
+    // Model calls can take >10s on real screenshots; use a higher client timeout.
+    private let timeout: TimeInterval = 35.0
 
     init(baseURL: URL = URL(string: "http://localhost:8000")!) {
         self.baseURL = baseURL
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout
         self.session = URLSession(configuration: config)
     }
 

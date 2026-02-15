@@ -147,6 +147,7 @@ async def generate_plan(
                 messages=messages,
                 max_tokens=2000,
                 temperature=0.1,
+                response_format={"type": "json_object"},
             )
 
             raw_text = response.choices[0].message.content or ""
@@ -233,6 +234,7 @@ async def generate_replan(
                 messages=messages,
                 max_tokens=2000,
                 temperature=0.1,
+                response_format={"type": "json_object"},
             )
 
             raw_text = response.choices[0].message.content or ""
@@ -316,6 +318,7 @@ async def generate_next_step(
                 messages=messages,
                 max_tokens=1000,
                 temperature=0.1,
+                response_format={"type": "json_object"},
             )
 
             raw_text = response.choices[0].message.content or ""
